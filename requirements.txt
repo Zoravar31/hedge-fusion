@@ -1,0 +1,7 @@
+# HedgeFusion dependencies
+openai>=1.30.0
+yfinance>=0.2.40
+loguru>=0.7.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+# kiteconnect>=5.0.1   # Uncomment when ready for live trading
