@@ -176,8 +176,4 @@ HedgeFusion is for **educational and research purposes only**. It is not SEBI-re
 ## Credits
 
 Built by [@Zoravar31](https://github.com/Zoravar31).  
-Architecturally inspired by:
-- [TradingAgents](https://github.com/TauricResearch/TradingAgents) by TauricResearch (Apache-2.0)
-- [AutoHedge](https://github.com/The-Swarm-Corporation/AutoHedge) by The Swarm Corporation (MIT)
 
-This is an original implementation — no source code was copied from either project.
