@@ -1,0 +1,45 @@
+HedgeFusion
+│
+├── BRAIN (9 AI Agents)
+│   ├── Analyst Team (run in parallel, ~60 sec)
+│   │   ├── Fundamentals  → P/E, ROE, DCF, balance sheet
+│   │   ├── Technical     → RSI, MACD, 200 DMA, Supertrend
+│   │   ├── Sentiment     → FII/DII flows, bulk deals, news tone
+│   │   └── News          → RBI/SEBI macro, sector events, catalysts
+│   │
+│   ├── Research Team (debate layer, ~90 sec)
+│   │   ├── Bull Researcher  → builds strongest buy case
+│   │   ├── Bear Researcher  → builds strongest bear case
+│   │   └── Research Manager → adjudicates → BUY/SELL/HOLD + PASS/BLOCK
+│   │
+│   └── Execution Team (gate layer, ~60 sec)
+│       ├── Trader          → generates exact Kite order params
+│       ├── Risk Manager    → validates qty, R:R, sector limits
+│       └── Portfolio Mgr   → final APPROVE or VETO
+│
+├── DATA FEEDS (no API key needed)
+│   ├── yfinance          → live NSE prices, OHLCV, fundamentals
+│   ├── NSE RSS feeds     → ET, Moneycontrol, Business Standard, RBI
+│   └── NSE APIs          → FII/DII flows, bulk deals, shareholding
+│
+├── EXECUTION
+│   ├── Paper mode        → logs to CSV, zero real money
+│   └── Live mode         → Zerodha Kite Connect (when ready)
+│
+└── TOOLS (10 standalone modules)
+    ├── hf.py                → unified command hub
+    ├── portfolio_runner.py  → run all 10 holdings at once
+    ├── multibagger_screener → scan 80 NSE stocks for 2x-5x candidates
+    ├── fii_dii_dashboard    → institutional flow intelligence
+    ├── backtester.py        → test signals on historical data
+    ├── risk_dashboard.py    → VaR, concentration, drawdown
+    ├── sector_rotation.py   → track where smart money flows
+    ├── earnings_calendar    → upcoming results + pre-earnings briefs
+    ├── watchlist.py         → BUY ZONE scanner for target stocks
+    ├── trade_journal.py     → P&L tracker and agent accuracy log
+    ├── alert_system.py      → Telegram / Gmail / WhatsApp alerts
+    └── scheduler.py         → autonomous 9:30 AM IST daily runner
+
+
+What it is NOT: A get-rich-quick system. It is a research and analysis platform that replicates what a small hedge fund analyst 
+team does — gathering data, debating, sizing positions, and gatekeeping orders — but powered by AI instead of humans.
