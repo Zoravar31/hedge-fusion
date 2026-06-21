@@ -67,6 +67,11 @@ MENU = """
   │  11. Test alerts                            │
   │  12. Start daily scheduler                  │
   │  13. Show config                            │
+  │  14. Position sizer                         │
+  │  15. Analytics (XIRR / Sharpe / Alpha)      │
+  │  16. Feedback engine (signal accuracy)      │
+  │  17. Agent memory report                    │
+  │  18. Export dashboard data                  │
   │  0.  Exit                                   │
   └─────────────────────────────────────────────┘
 """
@@ -228,6 +233,60 @@ def cmd_fii(args):
         run_fii_dii_dashboard(stock_tickers=tickers, use_ai=not getattr(args,"no_ai",False))
 
 
+def cmd_sizer(args):
+    from position_sizer import interactive_calculator, calculate_position
+    if getattr(args, 'entry', None) and getattr(args, 'stop', None):
+        from config import PORTFOLIO_SIZE_INR
+        import json
+        result = calculate_position(
+            portfolio_inr=PORTFOLIO_SIZE_INR,
+            entry_price=args.entry,
+            stop_loss=args.stop,
+            target_price=getattr(args, 'target', 0) or 0,
+            risk_pct=getattr(args, 'risk', 2.0) or 2.0,
+        )
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        interactive_calculator()
+
+
+def cmd_analytics(args):
+    from analytics import compute_portfolio_analytics, print_analytics_report, save_analytics
+    from config import HOLDINGS
+    print("\nRunning portfolio analytics (fetching 1Y data)...")
+    r = compute_portfolio_analytics(HOLDINGS)
+    print_analytics_report(r)
+    if getattr(args, 'save', False):
+        save_analytics(r)
+
+
+def cmd_feedback(args):
+    from feedback_engine import run_feedback_engine, print_accuracy_report, compute_accuracy, load_outcomes
+    if getattr(args, 'report', False):
+        from feedback_engine import load_outcomes, compute_accuracy
+        acc = compute_accuracy(load_outcomes())
+        print_accuracy_report(acc)
+    else:
+        acc = run_feedback_engine(ticker=getattr(args, 'ticker', None))
+        print_accuracy_report(acc)
+
+
+def cmd_memory(args):
+    from agent_memory import print_memory_report, get_memory_context
+    ticker = getattr(args, 'ticker', None)
+    if ticker:
+        ctx = get_memory_context(ticker.upper())
+        print(f"\nMemory context for {ticker.upper()}:\n")
+        print(ctx)
+    else:
+        print_memory_report()
+
+
+def cmd_export(args):
+    from data_exporter import export_dashboard_data
+    export_dashboard_data(silent=False)
+
+
 def cmd_alerts(args):
     from alert_system import send_test_alert
     send_test_alert()
@@ -334,8 +393,32 @@ def interactive():
             class FakeArgs: pass
             cmd_config(FakeArgs())
 
+        elif choice == "14":
+            from position_sizer import interactive_calculator
+            interactive_calculator()
+
+        elif choice == "15":
+            from analytics import compute_portfolio_analytics, print_analytics_report
+            from config import HOLDINGS
+            print("  Running analytics (takes ~30 sec)...")
+            r = compute_portfolio_analytics(HOLDINGS)
+            print_analytics_report(r)
+
+        elif choice == "16":
+            from feedback_engine import run_feedback_engine, print_accuracy_report
+            acc = run_feedback_engine()
+            print_accuracy_report(acc)
+
+        elif choice == "17":
+            from agent_memory import print_memory_report
+            print_memory_report()
+
+        elif choice == "18":
+            from data_exporter import export_dashboard_data
+            export_dashboard_data()
+
         else:
-            print("  Invalid choice. Please enter 0-12.")
+            print("  Invalid choice. Please enter 0-18.")
 
 
 # ── CLI parser ────────────────────────────────────────────────
@@ -394,6 +477,22 @@ def main():
     p_fii.add_argument("--tickers", help="Comma-separated tickers")
     p_fii.add_argument("--no-ai",   action="store_true")
 
+    p_sz = sub.add_parser("sizer", help="Position size calculator")
+    p_sz.add_argument("--entry",  type=float, help="Entry price")
+    p_sz.add_argument("--stop",   type=float, help="Stop loss price")
+    p_sz.add_argument("--target", type=float, help="Target price")
+    p_sz.add_argument("--risk",   type=float, default=2.0, help="Risk pct")
+    p_an = sub.add_parser("analytics", help="XIRR, CAGR, Sharpe, benchmark vs Nifty")
+    p_an.add_argument("--save", action="store_true", help="Save to data/analytics.json")
+
+    p_fb = sub.add_parser("feedback",  help="Evaluate signal accuracy + feedback loop")
+    p_fb.add_argument("--ticker", help="Evaluate one ticker")
+    p_fb.add_argument("--report", action="store_true", help="Show report only")
+
+    p_mem = sub.add_parser("memory",    help="Show agent memory per ticker")
+    p_mem.add_argument("--ticker", help="Show memory for one ticker")
+
+    sub.add_parser("export",     help="Export dashboard data to data/dashboard_data.json")
     sub.add_parser("alerts",    help="Test alert channels")
     sub.add_parser("scheduler", help="Start daily scheduler")
     sub.add_parser("config",    help="Show configuration")
@@ -412,6 +511,11 @@ def main():
         "sector":    cmd_sector,
         "earnings":  cmd_earnings,
         "fii":       cmd_fii,
+        "sizer":     cmd_sizer,
+        "analytics": cmd_analytics,
+        "feedback":  cmd_feedback,
+        "memory":    cmd_memory,
+        "export":    cmd_export,
         "alerts":    cmd_alerts,
         "scheduler": cmd_scheduler,
         "config":    cmd_config,

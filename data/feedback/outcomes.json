@@ -1,0 +1,87 @@
+{
+  "ZOMATO_20260620_0403": {
+    "outcome": "OPEN",
+    "signal_id": "ZOMATO_20260620_0403",
+    "ticker": "ZOMATO"
+  },
+  "ICICIBANK_20260620_0403": {
+    "outcome": "OPEN",
+    "signal_id": "ICICIBANK_20260620_0403",
+    "ticker": "ICICIBANK"
+  },
+  "BHARTIARTL_20260620_0403": {
+    "outcome": "OPEN",
+    "signal_id": "BHARTIARTL_20260620_0403",
+    "ticker": "BHARTIARTL"
+  },
+  "M&M_20260620_0404": {
+    "outcome": "OPEN",
+    "signal_id": "M&M_20260620_0404",
+    "ticker": "M&M"
+  },
+  "MAZDOCK_20260620_0404": {
+    "outcome": "OPEN",
+    "signal_id": "MAZDOCK_20260620_0404",
+    "ticker": "MAZDOCK"
+  },
+  "HDFCBANK_20260620_0406": {
+    "outcome": "OPEN",
+    "signal_id": "HDFCBANK_20260620_0406",
+    "ticker": "HDFCBANK"
+  },
+  "HINDZINC_20260620_0406": {
+    "outcome": "OPEN",
+    "signal_id": "HINDZINC_20260620_0406",
+    "ticker": "HINDZINC"
+  },
+  "BEL_20260620_0406": {
+    "outcome": "OPEN",
+    "signal_id": "BEL_20260620_0406",
+    "ticker": "BEL"
+  },
+  "VBL_20260620_0407": {
+    "outcome": "OPEN",
+    "signal_id": "VBL_20260620_0407",
+    "ticker": "VBL"
+  },
+  "ICICIBANK_20260622_0214": {
+    "outcome": "OPEN",
+    "signal_id": "ICICIBANK_20260622_0214",
+    "ticker": "ICICIBANK"
+  },
+  "BHARTIARTL_20260622_0216": {
+    "outcome": "OPEN",
+    "signal_id": "BHARTIARTL_20260622_0216",
+    "ticker": "BHARTIARTL"
+  },
+  "MAZDOCK_20260622_0217": {
+    "outcome": "OPEN",
+    "signal_id": "MAZDOCK_20260622_0217",
+    "ticker": "MAZDOCK"
+  },
+  "LT_20260622_0217": {
+    "outcome": "OPEN",
+    "signal_id": "LT_20260622_0217",
+    "ticker": "LT"
+  },
+  "M&M_20260622_0217": {
+    "outcome": "OPEN",
+    "signal_id": "M&M_20260622_0217",
+    "ticker": "M&M"
+  },
+  "BEL_20260622_0218": {
+    "outcome": "OPEN",
+    "signal_id": "BEL_20260622_0218",
+    "ticker": "BEL"
+  },
+  "HDFCBANK_20260622_0218": {
+    "outcome": "OPEN",
+    "signal_id": "HDFCBANK_20260622_0218",
+    "ticker": "HDFCBANK"
+  },
+  "HINDZINC_20260622_0218": {
+    "outcome": "OPEN",
+    "signal_id": "HINDZINC_20260622_0218",
+    "ticker": "HINDZINC"
+  }
+}
