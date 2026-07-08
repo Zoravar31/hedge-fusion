@@ -12,3 +12,5 @@ venv/
 "data/memory/" 
 "data/dashboard_data.json" 
 "data/memory/" 
+data/dashboard_data.json
+data/memory/
