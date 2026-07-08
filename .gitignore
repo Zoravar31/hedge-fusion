@@ -8,3 +8,5 @@ outputs/
 .venv/
 venv/
 *.egg-info/
+"data/dashboard_data.json" 
+"data/memory/" 

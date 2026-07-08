@@ -541,18 +541,86 @@ footer {
 
 <script>
 /* ── DATA ───────────────────────────────────────────────── */
-const HOLD = [
-  {name:'ICICIBANK', sector:'Banking',   qty:10,  avg:1245.00, ltp:1358.50, dayChg: 1.89},
-  {name:'BHARTIARTL',sector:'Telecom',   qty:5,   avg:1680.00, ltp:1892.15, dayChg: 3.21},
-  {name:'ZOMATO',    sector:'Consumer',  qty:50,  avg:215.00,  ltp:248.70,  dayChg: 2.67},
-  {name:'M&M',       sector:'Auto',      qty:4,   avg:1890.00, ltp:3125.40, dayChg: 0.96},
-  {name:'LT',        sector:'Capital',   qty:3,   avg:3400.00, ltp:4190.00, dayChg:-0.23},
-  {name:'MAZDOCK',   sector:'Defence',   qty:2,   avg:2100.00, ltp:2540.00, dayChg: 4.21},
-  {name:'BEL',       sector:'Defence',   qty:30,  avg:290.00,  ltp:312.80,  dayChg: 0.98},
-  {name:'HDFCBANK',  sector:'Banking',   qty:8,   avg:1650.00, ltp:1724.30, dayChg:-0.87},
-  {name:'HINDZINC',  sector:'Metals',    qty:15,  avg:485.00,  ltp:437.55,  dayChg:-1.32},
-  {name:'VBL',       sector:'FMCG',      qty:10,  avg:530.00,  ltp:540.20,  dayChg: 1.54},
+// Fallback data (used when dashboard_data.json is not available)
+const FALLBACK_HOLD = [
+  {name:'ICICIBANK', sector:'Banking',   qty:10,  avg:0, ltp:1358.50, dayChg: 1.89},
+  {name:'BHARTIARTL',sector:'Telecom',   qty:5,   avg:0, ltp:1892.15, dayChg: 3.21},
+  {name:'ZOMATO',    sector:'Consumer',  qty:50,  avg:0, ltp:248.70,  dayChg: 2.67},
+  {name:'M&M',       sector:'Auto',      qty:4,   avg:0, ltp:3125.40, dayChg: 0.96},
+  {name:'LT',        sector:'Capital',   qty:3,   avg:0, ltp:4190.00, dayChg:-0.23},
+  {name:'MAZDOCK',   sector:'Defence',   qty:2,   avg:0, ltp:2540.00, dayChg: 4.21},
+  {name:'BEL',       sector:'Defence',   qty:30,  avg:0, ltp:312.80,  dayChg: 0.98},
+  {name:'HDFCBANK',  sector:'Banking',   qty:8,   avg:0, ltp:1724.30, dayChg:-0.87},
+  {name:'HINDZINC',  sector:'Metals',    qty:15,  avg:0, ltp:437.55,  dayChg:-1.32},
+  {name:'VBL',       sector:'FMCG',      qty:10,  avg:0, ltp:540.20,  dayChg: 1.54},
 ];
+let HOLD = FALLBACK_HOLD;
+let LIVE_DATA = null;
+
+// Try to load live data from dashboard_data.json
+async function loadLiveData() {
+  try {
+    const resp = await fetch('data/dashboard_data.json?t=' + Date.now());
+    if (!resp.ok) throw new Error('Not found');
+    LIVE_DATA = await resp.json();
+    const rows = LIVE_DATA.portfolio && LIVE_DATA.portfolio.rows;
+    if (rows && rows.length > 0) {
+      HOLD = rows.map(r => ({
+        name:    r.ticker,
+        sector:  r.sector,
+        qty:     r.qty,
+        avg:     r.avg || 0,
+        ltp:     r.ltp || 0,
+        dayChg:  r.day_chg || 0,
+      }));
+      document.getElementById('dataSource').textContent =
+        '● Live data · ' + new Date(LIVE_DATA.generated_at).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
+      document.getElementById('dataSource').style.color = '#22c55e';
+      injectSignalsFromLive();
+      injectAnalyticsFromLive();
+      injectMemoryFromLive();
+    }
+  } catch(e) {
+    document.getElementById('dataSource').textContent = '○ Fallback data · run: python hf.py export';
+    document.getElementById('dataSource').style.color = '#f59e0b';
+  }
+  buildSummary();
+  buildHoldingsTable();
+  buildSectors();
+  buildMovers();
+  setTimeout(() => buildEquity('1W'), 150);
+}
+
+function injectSignalsFromLive() {
+  if (!LIVE_DATA || !LIVE_DATA.signals) return;
+  // Override SIGNALS with live data
+  window.LIVE_SIGNALS = LIVE_DATA.signals.map(s => ({
+    name:  s.ticker,
+    ltp:   s.fill_price || 0,
+    rec:   s.recommendation || 'HOLD',
+    conf:  s.confidence || '',
+    entry: s.entry_zone || '—',
+    sl:    s.stop_loss || 0,
+    tgt:   s.target1 || 0,
+    rr:    s.risk_reward || '—',
+    pm:    s.pm_decision || '',
+    oid:   s.order_id || '—',
+    bull:  s.bull_conviction,
+    bear:  s.bear_conviction,
+    run:   s.run_time ? new Date(s.run_time).toLocaleString('en-IN') : '',
+  }));
+}
+
+function injectAnalyticsFromLive() {
+  if (!LIVE_DATA) return;
+  const nifty = LIVE_DATA.nifty || {};
+  window.LIVE_NIFTY = nifty;
+}
+
+function injectMemoryFromLive() {
+  if (!LIVE_DATA || !LIVE_DATA.agent_memory) return;
+  window.LIVE_MEMORY = LIVE_DATA.agent_memory;
+}
 
 const SIGNALS = [
   {name:'ICICIBANK', ltp:1358.50, rec:'SELL', conf:'High',   entry:'₹1,340–1,360', sl:1391, tgt:1192, rr:'1:2.5', pm:'APPROVED', oid:'PAPER-001001'},
@@ -784,7 +852,8 @@ function buildHoldingsTable2() {
 /* ── SIGNALS TABLE ───────────────────────────────────────── */
 function buildSignals() {
   const tb = document.getElementById('signalsTbody');
-  tb.innerHTML = SIGNALS.map(s=>{
+  const sigData = (window.LIVE_SIGNALS && window.LIVE_SIGNALS.length > 0) ? window.LIVE_SIGNALS : SIGNALS;
+  tb.innerHTML = sigData.map(s=>{
     const cls = {SELL:'sig-sell',BUY:'sig-buy',HOLD:'sig-hold'}[s.rec];
     const slStr = s.sl ? inr2(s.sl) : '—';
     const tgtStr = s.tgt ? inr2(s.tgt) : '—';
@@ -985,13 +1054,16 @@ function updateClock(){
 }
 
 /* ── INIT ────────────────────────────────────────────────── */
-buildSummary();
-buildHoldingsTable();
-buildSectors();
-buildMovers();
+// Add data source indicator to nav
+const dsEl = document.createElement('span');
+dsEl.id = 'dataSource';
+dsEl.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--text-3);margin-left:8px';
+dsEl.textContent = '○ Loading...';
+document.querySelector('.nav-time').after(dsEl);
+
 updateClock();
 setInterval(updateClock, 30000);
-setTimeout(()=>buildEquity('1W'), 150);
+loadLiveData();  // Loads data then calls buildSummary, buildHoldingsTable etc.
 </script>
 </body>
 </html>

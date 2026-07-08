@@ -434,3 +434,166 @@ DATA_TOOL_MAP = {
     "get_macro_india_context": get_macro_india_context,
     "get_bulk_block_deals": get_bulk_block_deals,
 }
+
+
+# ──────────────────────────────────────────────
+# Feature #12 — Nifty 50 PCR (Options Chain)
+# ──────────────────────────────────────────────
+
+def get_nifty_pcr() -> str:
+    """
+    Fetch live Nifty 50 Put/Call Ratio from NSE options chain.
+
+    PCR interpretation (contrarian signal):
+      PCR > 1.3  → market heavily hedged / fearful → contrarian BUY signal
+      PCR 0.8–1.3 → neutral / balanced market
+      PCR < 0.8  → call-heavy / complacent → caution, market may reverse down
+
+    Data source: NSE free API (no auth required, but needs browser headers + cookies).
+    Cached for 15 minutes — options PCR shifts intraday.
+    """
+    cache_key = "nifty_pcr"
+    cached = _cache_read(cache_key, ttl_minutes=15)
+    if cached:
+        return cached
+
+    url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+    try:
+        session = requests.Session()
+        # NSE requires a prior page visit to set anti-bot cookies
+        session.get(
+            "https://www.nseindia.com",
+            headers={
+                **HEADERS,
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.nseindia.com/",
+            },
+            timeout=8,
+        )
+        time.sleep(0.6)  # brief pause so NSE doesn't rate-limit
+
+        r = session.get(
+            url,
+            headers={
+                **HEADERS,
+                "Accept": "application/json",
+                "Referer": "https://www.nseindia.com/option-chain",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # NSE response: data.filtered.data = list of strike rows
+        # Each row has CE (call) and PE (put) sub-dicts with openInterest
+        records = (data.get("filtered") or data.get("records") or {}).get("data") or []
+
+        total_call_oi = 0
+        total_put_oi  = 0
+        atm_strike    = None
+        spot_price    = None
+
+        # Spot price lives in filtered.underlyingValue or records.underlyingValue
+        for block in [data.get("filtered", {}), data.get("records", {})]:
+            if block.get("underlyingValue"):
+                spot_price = float(block["underlyingValue"])
+                break
+
+        for row in records:
+            ce = row.get("CE") or {}
+            pe = row.get("PE") or {}
+            total_call_oi += ce.get("openInterest", 0)
+            total_put_oi  += pe.get("openInterest", 0)
+
+        if total_call_oi == 0:
+            raise ValueError("Zero call OI — likely NSE blocked the request")
+
+        pcr = round(total_put_oi / total_call_oi, 4)
+
+        # Derive ATM strike (nearest to spot)
+        if spot_price and records:
+            strikes = []
+            for row in records:
+                ce = row.get("CE") or {}
+                pe = row.get("PE") or {}
+                strike = ce.get("strikePrice") or pe.get("strikePrice")
+                if strike:
+                    strikes.append(strike)
+            if strikes:
+                atm_strike = min(strikes, key=lambda s: abs(s - spot_price))
+
+        # PCR sentiment interpretation
+        if pcr >= 1.5:
+            signal = "EXTREME FEAR — strong contrarian BUY signal"
+            sentiment = "bullish_contrarian"
+        elif pcr >= 1.3:
+            signal = "HIGH HEDGING — moderate contrarian buy signal"
+            sentiment = "mildly_bullish"
+        elif pcr >= 0.8:
+            signal = "NEUTRAL — balanced put/call activity"
+            sentiment = "neutral"
+        elif pcr >= 0.6:
+            signal = "CALL-HEAVY — mild complacency, watch for reversal"
+            sentiment = "mildly_bearish"
+        else:
+            signal = "EXTREME COMPLACENCY — elevated reversal risk"
+            sentiment = "bearish_contrarian"
+
+        result = {
+            "symbol":          "NIFTY",
+            "pcr":             pcr,
+            "total_put_oi":    total_put_oi,
+            "total_call_oi":   total_call_oi,
+            "spot_price":      spot_price,
+            "atm_strike":      atm_strike,
+            "signal":          signal,
+            "sentiment":       sentiment,
+            "interpretation":  (
+                f"PCR of {pcr:.2f} — {signal}. "
+                f"Total Put OI: {total_put_oi:,} | Total Call OI: {total_call_oi:,}. "
+                f"A PCR > 1.3 means market participants are buying more puts (protection/hedges) "
+                f"than calls — historically a contrarian bullish signal as retail fear peaks."
+            ),
+            "fetched_at": datetime.now().isoformat(),
+        }
+
+        out = json.dumps(result, default=str)
+        _cache_write(cache_key, out)
+        logger.info("Nifty PCR fetched: {:.3f} — {}", pcr, signal)
+        return out
+
+    except Exception as e:
+        logger.warning("get_nifty_pcr failed: {}", e)
+        # Return a degraded-gracefully result so agents don't crash
+        fallback = {
+            "symbol": "NIFTY",
+            "pcr": None,
+            "signal": "unavailable",
+            "sentiment": "unknown",
+            "error": str(e),
+            "interpretation": (
+                "Nifty PCR could not be fetched from NSE (possible rate limit or market closed). "
+                "Proceed with other sentiment signals."
+            ),
+            "fetched_at": datetime.now().isoformat(),
+        }
+        return json.dumps(fallback)
+
+
+# Register get_nifty_pcr in the tool registry
+DATA_TOOL_DEFINITIONS.append({
+    "type": "function",
+    "function": {
+        "name": "get_nifty_pcr",
+        "description": (
+            "Get Nifty 50 Put/Call Ratio (PCR) from NSE live options chain. "
+            "PCR > 1.3 = market heavily hedged / fearful = contrarian BUY signal. "
+            "PCR < 0.8 = call-heavy complacency = caution. "
+            "Use this to gauge overall market fear/greed before placing any trade."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+})
+DATA_TOOL_MAP["get_nifty_pcr"] = get_nifty_pcr

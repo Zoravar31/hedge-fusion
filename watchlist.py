@@ -151,7 +151,18 @@ def scan_watchlist_stock(item: dict) -> dict:
         return result
     except Exception as e:
         logger.error("Watchlist scan failed {}: {}", ticker, e)
-        return {"ticker": ticker, "alert_level": "ERROR", "note": str(e)}
+        return {
+            "ticker":       ticker,
+            "alert_level":  "ERROR",
+            "note":         str(e)[:80],
+            "current_price":0,
+            "entry_target": item.get("entry_target", 0),
+            "action":       "ERROR",
+            "suggested_entry": 0,
+            "stop_loss":    0,
+            "target_3m":    0,
+            "watch_reason": item.get("reason",""),
+        }
 
 
 def run_watchlist_scan() -> list[dict]:
