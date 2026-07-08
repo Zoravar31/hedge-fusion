@@ -10,3 +10,5 @@ venv/
 *.egg-info/
 "data/dashboard_data.json" 
 "data/memory/" 
+"data/dashboard_data.json" 
+"data/memory/" 
