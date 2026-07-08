@@ -9,11 +9,13 @@ Data sources:
      Returns: net buy/sell by FII and DII in equity and derivatives
 
   2. NSE Bulk Deals
-     https://www.nseindia.com/api/bulk-deals
+     https://www.nseindia.com/api/snapshot-capital-market-largedeal
+     (single unified endpoint — bulk/block/short data all under one JSON,
+      keyed by BULK_DEALS_DATA / BLOCK_DEALS_DATA / SHORT_DEALS_DATA)
      Returns: large single-transaction trades (>0.5% of equity)
 
   3. NSE Block Deals
-     https://www.nseindia.com/api/block-deals
+     Same endpoint as above, BLOCK_DEALS_DATA key
      Returns: negotiated block trades (>500k shares or >₹5cr)
 
   4. NSE Shareholding Pattern (quarterly)
@@ -114,7 +116,25 @@ def _cache_set(key: str, data: str) -> None:
 
 def get_fii_dii_daily(days: int = 10) -> str:
     """
-    Fetch FII and DII net buy/sell activity for the last N trading days.
+    Fetch FII and DII net buy/sell activity from NSE's real-time endpoint.
+
+    IMPORTANT — NSE's fiidiiTradeReact endpoint only ever returns the LATEST
+    single trading day's figures (2 rows: one 'FII/FPI *' row, one 'DII **'
+    row) — it is NOT a rolling N-day history despite the `days` parameter
+    name. The `days` argument is kept for API compatibility / future use if
+    a historical endpoint is wired in, but in practice `paired` will almost
+    always contain exactly 1 entry (today's flow only).
+
+    NSE's JSON schema (confirmed against live captures) is:
+      [{"category": "DII **",     "date": "28-May-2021",
+        "buyValue": "6440.88", "sellValue": "5165.66", "netValue": "1275.22"},
+       {"category": "FII/FPI *",  "date": "28-May-2021",
+        "buyValue": "5917.71", "sellValue": "5004.12", "netValue": "913.59"}]
+
+    buyValue / sellValue / netValue are STRINGS but are already expressed
+    in ₹ CRORE — no further unit conversion is needed. (A prior version of
+    this function divided by 1e7 again here, silently crushing every real
+    number like 6440.88 down to ~0.0006 → rounds to 0.00. Fixed.)
 
     Returns JSON with:
       - date
@@ -127,7 +147,7 @@ def get_fii_dii_daily(days: int = 10) -> str:
     Parameters
     ----------
     days : int
-        Number of recent trading days to return (max 30).
+        Kept for compatibility. In practice NSE returns only the latest day.
     """
     cache_key = f"daily_{days}"
     cached = _cache_get(cache_key, ttl_min=60)
@@ -144,6 +164,7 @@ def get_fii_dii_daily(days: int = 10) -> str:
         processed = []
         for item in raw_data[:days]:
             try:
+                # buyValue/sellValue are already in ₹ Crore — DO NOT divide by 1e7 again.
                 fii_buy  = float(str(item.get("buyValue",  "0")).replace(",","") or 0)
                 fii_sell = float(str(item.get("sellValue", "0")).replace(",","") or 0)
                 fii_net  = fii_buy - fii_sell
@@ -156,9 +177,9 @@ def get_fii_dii_daily(days: int = 10) -> str:
                 entry = {
                     "date":            item.get("date", ""),
                     "category":        category,
-                    "buy_inr_cr":      round(fii_buy / 1e7, 2),
-                    "sell_inr_cr":     round(fii_sell / 1e7, 2),
-                    "net_inr_cr":      round(fii_net / 1e7, 2),
+                    "buy_inr_cr":      round(fii_buy, 2),
+                    "sell_inr_cr":     round(fii_sell, 2),
+                    "net_inr_cr":      round(fii_net, 2),
                 }
                 processed.append(entry)
             except Exception:
@@ -201,14 +222,23 @@ def get_fii_dii_daily(days: int = 10) -> str:
             })
             i += 2
 
+        # NOTE: NSE's real-time endpoint returns only the latest single
+        # trading day (paired will contain 1 entry in the vast majority of
+        # calls). "fii_net_available_cr" sums whatever `paired` actually
+        # holds — usually just today — it is NOT a guaranteed 10-day sum.
         out = json.dumps({
             "source":     "NSE FII/DII Trade React API",
             "days":       len(paired),
             "fetched_at": datetime.now().isoformat(),
             "data":       paired,
+            "note": (
+                "NSE's real-time endpoint exposes only the latest trading "
+                "day. 'days' above reflects how many day-entries were "
+                "actually returned (usually 1), not a guaranteed history."
+            ),
             "summary": {
-                "fii_net_10d": round(sum(p["fii_net_cr"] for p in paired), 2),
-                "dii_net_10d": round(sum(p["dii_net_cr"] for p in paired), 2),
+                "fii_net_available_cr": round(sum(p["fii_net_cr"] for p in paired), 2),
+                "dii_net_available_cr": round(sum(p["dii_net_cr"] for p in paired), 2),
                 "fii_trend":   "BUYING" if sum(p["fii_net_cr"] for p in paired) > 0 else "SELLING",
                 "dii_trend":   "BUYING" if sum(p["dii_net_cr"] for p in paired) > 0 else "SELLING",
             }
@@ -233,8 +263,8 @@ def _fii_dii_fallback(days: int) -> str:
         "days":       0,
         "data":       [],
         "summary": {
-            "fii_net_10d": None,
-            "dii_net_10d": None,
+            "fii_net_available_cr": None,
+            "dii_net_available_cr": None,
             "fii_trend":   "UNKNOWN",
             "dii_trend":   "UNKNOWN",
         },
@@ -271,24 +301,27 @@ def get_bulk_deals(ticker: Optional[str] = None, days: int = 30) -> str:
 
     try:
         session  = _get_nse_session()
-        url      = "https://www.nseindia.com/api/bulk-deals"
+        # NSE consolidated all large-deal data under ONE endpoint (old
+        # /api/bulk-deals and /api/block-deals paths were retired).
+        # Response JSON has BULK_DEALS_DATA / BLOCK_DEALS_DATA / SHORT_DEALS_DATA keys.
+        url      = "https://www.nseindia.com/api/snapshot-capital-market-largedeal"
         resp     = session.get(url, timeout=12)
         resp.raise_for_status()
         raw      = resp.json()
-        deals    = raw.get("data", raw) if isinstance(raw, dict) else raw
+        deals    = raw.get("BULK_DEALS_DATA", [])
 
         cutoff   = datetime.now() - timedelta(days=days)
         filtered = []
 
         for d in (deals or []):
             try:
-                sym   = str(d.get("symbol","") or d.get("SYMBOL","")).upper()
+                sym   = str(d.get("BD_SYMBOL","") or d.get("symbol","") or d.get("SYMBOL","")).upper()
                 if ticker and sym != ticker.upper():
                     continue
 
-                deal_date_str = d.get("date","") or d.get("DATE","") or d.get("BD_DT_DATE","")
+                deal_date_str = d.get("BD_DT_DATE","") or d.get("date","") or d.get("DATE","")
                 try:
-                    deal_dt = datetime.strptime(str(deal_date_str)[:10], "%d-%b-%Y")
+                    deal_dt = datetime.strptime(str(deal_date_str)[:11], "%d-%b-%Y")
                 except Exception:
                     try:
                         deal_dt = datetime.strptime(str(deal_date_str)[:10], "%Y-%m-%d")
@@ -397,25 +430,28 @@ def get_block_deals(ticker: Optional[str] = None) -> str:
 
     try:
         session = _get_nse_session()
-        url     = "https://www.nseindia.com/api/block-deals"
+        # Same consolidated endpoint as bulk deals — BLOCK_DEALS_DATA key.
+        # Uses the same BD_* field naming as bulk deals (confirmed against
+        # NSE's live JSON schema).
+        url     = "https://www.nseindia.com/api/snapshot-capital-market-largedeal"
         resp    = session.get(url, timeout=12)
         resp.raise_for_status()
         raw     = resp.json()
-        deals   = raw.get("data", raw) if isinstance(raw, dict) else raw
+        deals   = raw.get("BLOCK_DEALS_DATA", [])
 
         filtered = []
         for d in (deals or []):
-            sym = str(d.get("symbol","") or d.get("SYMBOL","")).upper()
+            sym = str(d.get("BD_SYMBOL","") or d.get("symbol","") or d.get("SYMBOL","")).upper()
             if ticker and sym != ticker.upper():
                 continue
-            qty   = float(str(d.get("qty","0") or d.get("BLOCK_DEAL_QTY","0")).replace(",","") or 0)
-            price = float(str(d.get("price","0") or d.get("BLOCK_DEAL_PRICE","0")).replace(",","") or 0)
+            qty   = float(str(d.get("BD_QTY_TRD","0") or d.get("qty","0")).replace(",","") or 0)
+            price = float(str(d.get("BD_TP_WATP","0") or d.get("price","0")).replace(",","") or 0)
             val   = round(qty * price / 1e7, 2)
             filtered.append({
-                "date":     d.get("date","") or d.get("BLOCK_DEAL_DATE",""),
+                "date":     d.get("BD_DT_DATE","") or d.get("date",""),
                 "symbol":   sym,
-                "client":   d.get("clientName","") or d.get("BLOCK_DEAL_CLIENT_NAME",""),
-                "buy_sell": str(d.get("buySell","") or d.get("BLOCK_DEAL_BUY_SELL_FLAG","")).upper(),
+                "client":   d.get("BD_CLIENT_NAME","") or d.get("clientName",""),
+                "buy_sell": str(d.get("BD_BUY_SELL","") or d.get("buySell","")).upper(),
                 "qty":      int(qty),
                 "price_inr":price,
                 "value_cr": val,
@@ -533,10 +569,19 @@ def get_stock_shareholding(ticker: str) -> str:
 
 def get_fii_dii_summary() -> str:
     """
-    Get a comprehensive FII/DII market-level summary including:
-    - Net flows over 1d, 5d, 10d, 1mo
-    - Recent bulk deals across market
-    - Market-level institutional sentiment signal
+    Get a real-time FII/DII market-level summary.
+
+    IMPORTANT: NSE's fiidiiTradeReact endpoint (used by get_fii_dii_daily)
+    only exposes the LATEST single trading day — never a rolling 5/10-day
+    history. This function therefore treats the 1-day figures as the
+    primary, always-available signal, and reports 5day_cr/10day_cr as None
+    with an explicit note (rather than silently degrading the whole
+    interpretation to "unavailable" just because 5-day data structurally
+    cannot exist from this real-time source).
+
+    If true multi-day history is needed later, NSE's historical archive
+    endpoint would need to be wired in separately — this endpoint is
+    real-time-only by design.
 
     Returns structured JSON for use by agents.
     """
@@ -551,26 +596,26 @@ def get_fii_dii_summary() -> str:
     data   = daily.get("data", [])
     summary_obj = daily.get("summary", {})
 
-    # Compute rolling sums
-    def net_sum(n):
-        return round(sum(d.get("fii_net_cr",0) for d in data[:n]), 2)
+    # Compute rolling sums IF enough paired days happen to be available
+    # (in practice this will almost always be exactly 1 day — see docstring)
+    def net_sum(field, n):
+        return round(sum(d.get(field, 0) for d in data[:n]), 2)
 
     fii_1d  = data[0]["fii_net_cr"] if data else None
-    fii_5d  = net_sum(5) if len(data) >= 5 else None
-    fii_10d = net_sum(10) if len(data) >= 10 else None
-
-    def dii_sum(n):
-        return round(sum(d.get("dii_net_cr",0) for d in data[:n]), 2)
+    fii_5d  = net_sum("fii_net_cr", 5)  if len(data) >= 5  else None
+    fii_10d = net_sum("fii_net_cr", 10) if len(data) >= 10 else None
 
     dii_1d  = data[0]["dii_net_cr"] if data else None
-    dii_5d  = dii_sum(5) if len(data) >= 5 else None
-    dii_10d = dii_sum(10) if len(data) >= 10 else None
+    dii_5d  = net_sum("dii_net_cr", 5)  if len(data) >= 5  else None
+    dii_10d = net_sum("dii_net_cr", 10) if len(data) >= 10 else None
 
-    # Overall institutional signal
+    # Overall institutional signal — thresholds sized for a SINGLE DAY's
+    # flow (typical single-day FII activity is roughly ₹500-3000 Cr),
+    # not a 5-day cumulative sum.
     def signal(fii, dii):
         if fii is None:
             return "DATA_UNAVAILABLE"
-        if fii > 500 and dii > 200:
+        if fii > 1500 and dii > 500:
             return "STRONGLY_BULLISH 🔥 (Both buying heavily)"
         if fii > 0 and dii > 0:
             return "BULLISH (Both buying)"
@@ -578,7 +623,7 @@ def get_fii_dii_summary() -> str:
             return "MIXED (FII buying, DII selling)"
         if fii < 0 and dii > 0:
             return "CAUTIOUS (FII selling, DII absorbing)"
-        if fii < -500 and dii < -200:
+        if fii < -1500 and dii < -500:
             return "STRONGLY_BEARISH 🚨 (Both selling heavily)"
         if fii < 0 and dii < 0:
             return "BEARISH (Both selling)"
@@ -606,38 +651,51 @@ def get_fii_dii_summary() -> str:
             "signal":         bulk.get("aggregate_signal","UNKNOWN"),
             "top_3":          bulk.get("top_deals",[])[:3],
         },
+        # Primary signal is based on TODAY's flow (always available).
+        # 5d/10d signals fall back to "N-DAY DATA UNAVAILABLE" rather than
+        # a bare "DATA_UNAVAILABLE" so it's clear WHY, not that something broke.
         "market_signal_1d":  signal(fii_1d, dii_1d),
-        "market_signal_5d":  signal(fii_5d, dii_5d),
-        "market_signal_10d": signal(fii_10d, dii_10d),
-        "interpretation": _interpret_flows(fii_5d, dii_5d, bulk),
-        "daily_data":     data[:5],   # last 5 days for context
+        "market_signal_5d":  signal(fii_5d, dii_5d) if fii_5d is not None else "5-DAY DATA UNAVAILABLE (real-time endpoint only exposes latest day)",
+        "market_signal_10d": signal(fii_10d, dii_10d) if fii_10d is not None else "10-DAY DATA UNAVAILABLE (real-time endpoint only exposes latest day)",
+        "interpretation": _interpret_flows(fii_1d, dii_1d, bulk),
+        "daily_data":     data[:5],   # whatever's available (usually 1 day)
+        "note": (
+            "5-day/10-day aggregates are structurally unavailable from NSE's "
+            "real-time fiidiiTradeReact endpoint, which only exposes the "
+            "latest trading day. Today's figures (today_cr, market_signal_1d, "
+            "interpretation) are live and reliable."
+        ),
     }
     out = json.dumps(result, default=str)
     _cache_set(cache_key, out)
     return out
 
 
-def _interpret_flows(fii_5d, dii_5d, bulk: dict) -> str:
-    """Generate plain-English interpretation of institutional flows."""
+def _interpret_flows(fii_1d, dii_1d, bulk: dict) -> str:
+    """
+    Generate plain-English interpretation of institutional flows.
+    Uses TODAY's net flow as the primary signal — the only figure NSE's
+    real-time endpoint reliably provides (see get_fii_dii_summary docstring).
+    """
     lines = []
-    if fii_5d is None:
-        return "FII/DII data unavailable — check NSE website during market hours."
+    if fii_1d is None:
+        return "FII/DII data unavailable — check NSE website during market hours (9 AM - 6 PM IST)."
 
-    if fii_5d > 1000:
-        lines.append(f"FII have been aggressive NET BUYERS of ₹{fii_5d:,.0f}Cr over 5 days — strong foreign conviction in Indian markets.")
-    elif fii_5d > 0:
-        lines.append(f"FII are NET BUYERS of ₹{fii_5d:,.0f}Cr over 5 days — mild positive signal.")
-    elif fii_5d > -1000:
-        lines.append(f"FII are NET SELLERS of ₹{abs(fii_5d):,.0f}Cr over 5 days — mild caution.")
+    if fii_1d > 3000:
+        lines.append(f"FII were aggressive NET BUYERS of ₹{fii_1d:,.0f}Cr today — strong foreign conviction.")
+    elif fii_1d > 0:
+        lines.append(f"FII are NET BUYERS of ₹{fii_1d:,.0f}Cr today — mild positive signal.")
+    elif fii_1d > -3000:
+        lines.append(f"FII are NET SELLERS of ₹{abs(fii_1d):,.0f}Cr today — mild caution.")
     else:
-        lines.append(f"FII are HEAVY NET SELLERS of ₹{abs(fii_5d):,.0f}Cr over 5 days — risk-off signal for Indian markets. INR under pressure.")
+        lines.append(f"FII are HEAVY NET SELLERS of ₹{abs(fii_1d):,.0f}Cr today — risk-off signal for Indian markets. INR under pressure.")
 
-    if dii_5d and dii_5d > 0 and fii_5d < 0:
-        lines.append(f"DII (domestic MFs + insurance) are absorbing FII selling with ₹{dii_5d:,.0f}Cr net buy — acting as market stabiliser. Good support signal.")
-    elif dii_5d and dii_5d > 0:
-        lines.append(f"DII also buying ₹{dii_5d:,.0f}Cr — domestic funds aligned with foreign buyers.")
-    elif dii_5d and dii_5d < 0 and fii_5d < 0:
-        lines.append(f"Both FII and DII selling — rare double-exit signal. Exercise extra caution.")
+    if dii_1d is not None and dii_1d > 0 and fii_1d < 0:
+        lines.append(f"DII (domestic MFs + insurance) are absorbing FII selling with ₹{dii_1d:,.0f}Cr net buy today — acting as market stabiliser.")
+    elif dii_1d is not None and dii_1d > 0:
+        lines.append(f"DII also buying ₹{dii_1d:,.0f}Cr today — domestic funds aligned with foreign buyers.")
+    elif dii_1d is not None and dii_1d < 0 and fii_1d < 0:
+        lines.append("Both FII and DII selling today — rare double-exit signal. Exercise extra caution.")
 
     bulk_signal = bulk.get("aggregate_signal","")
     if "ACCUMULATION" in bulk_signal:

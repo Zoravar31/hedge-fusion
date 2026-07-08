@@ -1,282 +1,254 @@
 """
 HedgeFusion Agent Memory
-==========================
-Gives agents persistent memory between pipeline runs.
+===========================
+Per-ticker persistent memory so agents don't start from zero every run.
 
-Without memory:
-  Every run starts from zero. The Research Manager doesn't know
-  it said SELL on ICICIBANK 3 times in a row last week.
+Without memory: every pipeline run treats a stock as if it's the first
+time HedgeFusion has ever looked at it — no awareness that you already
+analysed HDFCBANK three times this month, or that the Research Manager
+flagged a specific risk last time that's worth re-checking.
 
-With memory:
-  - Tracks signal history per ticker
-  - Computes consecutive signal streak
-  - Tracks historical accuracy (was the agent right?)
-  - Feeds context into Research Manager prompt
-  - Detects regime changes (signal flip after streak)
+With memory: each pipeline run's key verdict is stored to
+data/agent_memory.json, keyed by ticker. Future pipeline runs can pull
+the last N verdicts for that ticker and feed them to agents as context
+("last time we analysed this stock, here's what we concluded and what
+happened since").
 
-Memory file: data/memory/{TICKER}.json
+Storage format (data/agent_memory.json):
+{
+  "RELIANCE": {
+    "history": [
+      {
+        "date": "2026-06-15T09:30:00",
+        "recommendation": "BUY",
+        "pm_decision": "APPROVE",
+        "confidence": "HIGH",
+        "entry_zone": "1270-1285",
+        "stop_loss": 1220,
+        "target1": 1380,
+        "key_thesis": "...",
+        "price_at_analysis": 1278.50
+      },
+      ...
+    ],
+    "last_updated": "2026-06-15T09:30:00"
+  }
+}
 
 Usage:
-    from agent_memory import load_memory, save_memory, get_memory_context
-    
-    # Before pipeline run:
-    ctx = get_memory_context("ICICIBANK")
-    # Inject ctx into Research Manager prompt
-    
-    # After pipeline run:
-    save_memory("ICICIBANK", recommendation="SELL", confidence="High", rr="1:2.5")
+    python agent_memory.py --ticker RELIANCE          # show history
+    python agent_memory.py --ticker RELIANCE --clear  # wipe history for one ticker
+    python agent_memory.py --stats                    # memory-wide stats
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from loguru import logger
 
-ROOT     = Path(__file__).parent
-MEM_DIR  = ROOT / "data" / "memory"
-MEM_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR    = Path(__file__).parent / "data"
+MEMORY_FILE = DATA_DIR / "agent_memory.json"
+DATA_DIR.mkdir(exist_ok=True)
+
+MAX_HISTORY_PER_TICKER = 10  # keep last 10 verdicts per stock, prune older
 
 
-# ── Memory schema ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Storage
+# ──────────────────────────────────────────────
 
-def _default_memory(ticker: str) -> dict:
-    return {
-        "ticker":               ticker,
-        "created_at":           datetime.now().isoformat(),
-        "last_updated":         None,
-        "total_runs":           0,
-        "signal_history":       [],   # last 10 runs
-        "consecutive_signal":   0,    # how many runs in a row with same rec
-        "consecutive_direction": None, # BUY / SELL / HOLD
-        "accuracy": {
-            "total_evaluated":  0,    # trades where outcome is known
-            "correct":          0,    # AI called direction right
-            "win_rate":         0.0,
-        },
-        "regime": {
-            "current":          None, # BULLISH / BEARISH / NEUTRAL
-            "changed_at":       None,
-            "flips":            0,    # times signal direction changed
-        },
-        "price_context": {
-            "last_known_ltp":   None,
-            "52w_high":         None,
-            "52w_low":          None,
-        }
-    }
-
-
-# ── Load / save ───────────────────────────────────────────────
-
-def load_memory(ticker: str) -> dict:
-    """Load memory for a ticker. Returns default if no memory exists."""
-    path = MEM_DIR / f"{ticker.upper()}.json"
-    if path.exists():
+def _load_all() -> dict:
+    if MEMORY_FILE.exists():
         try:
-            mem = json.loads(path.read_text(encoding="utf-8"))
-            # Ensure all keys exist (backward compat)
-            default = _default_memory(ticker)
-            for k, v in default.items():
-                if k not in mem:
-                    mem[k] = v
-            return mem
+            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
         except Exception as e:
-            logger.warning("Memory read failed {}: {}", ticker, e)
-    return _default_memory(ticker)
+            logger.warning("agent_memory: corrupt memory file, starting fresh: {}", e)
+            return {}
+    return {}
 
 
-def save_memory(
-    ticker:         str,
-    recommendation: str,
-    confidence:     str  = "",
-    risk_reward:    str  = "",
-    stop_loss:      float | None = None,
-    target1:        float | None = None,
-    pm_decision:    str  = "",
-    ltp:            float | None = None,
-) -> dict:
+def _save_all(data: dict) -> None:
+    MEMORY_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+
+
+# ──────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────
+
+def record_verdict(ticker: str, pipeline_state: dict) -> None:
     """
-    Save the result of a pipeline run to memory.
-    Call this at the end of every run_pipeline() call.
-    """
-    mem  = load_memory(ticker)
-    now  = datetime.now().isoformat()
-    rec  = recommendation.upper().strip()
+    Extract the key verdict from a completed pipeline run and append
+    it to that ticker's memory. Called automatically at the end of
+    run_pipeline() — see pipeline.py integration.
 
-    # Add to signal history (keep last 10)
+    Only stores the essentials (not full agent transcripts) to keep
+    the memory file small and the extracted context cheap to re-inject.
+    """
+    ticker = ticker.strip().upper()
+    all_mem = _load_all()
+
+    rv = pipeline_state.get("research_verdict", {})
+    pm = pipeline_state.get("pm_decision", {})
+    ex = pipeline_state.get("execution_result") or {}
+
     entry = {
-        "timestamp":     now,
-        "recommendation":rec,
-        "confidence":    confidence,
-        "risk_reward":   risk_reward,
-        "stop_loss":     stop_loss,
-        "target1":       target1,
-        "pm_decision":   pm_decision,
-        "ltp":           ltp,
-        "outcome":       None,   # filled by feedback_engine later
+        "date":               pipeline_state.get("completed_at", datetime.now().isoformat()),
+        "recommendation":     rv.get("recommendation", "?"),
+        "pm_decision":        pm.get("decision", "?"),
+        "confidence":         rv.get("confidence", "?"),
+        "entry_zone":         rv.get("entry_zone", ""),
+        "stop_loss":          rv.get("stop_loss", ""),
+        "target1":            rv.get("target1", ""),
+        "risk_reward":        rv.get("risk_reward", ""),
+        "key_thesis":         (rv.get("debate_verdict") or "")[:300],
+        "pm_note":            (pm.get("pm_note") or "")[:200],
+        "order_status":       ex.get("order_id") or ex.get("status", ""),
+        "elapsed_seconds":    pipeline_state.get("elapsed_seconds", 0),
     }
-    mem["signal_history"] = ([entry] + mem["signal_history"])[:10]
 
-    # Update consecutive signal streak
-    if rec in ("BUY","SELL","HOLD"):
-        if rec == mem["consecutive_direction"]:
-            mem["consecutive_signal"] += 1
-        else:
-            # Signal flipped
-            if mem["consecutive_direction"] is not None:
-                mem["regime"]["flips"] += 1
-                mem["regime"]["changed_at"] = now
-            mem["consecutive_signal"]   = 1
-            mem["consecutive_direction"] = rec
+    if ticker not in all_mem:
+        all_mem[ticker] = {"history": [], "last_updated": None}
 
-    # Update regime
-    if rec == "BUY":
-        mem["regime"]["current"] = "BULLISH"
-    elif rec == "SELL":
-        mem["regime"]["current"] = "BEARISH"
-    else:
-        mem["regime"]["current"] = "NEUTRAL"
+    all_mem[ticker]["history"].append(entry)
+    # Keep only the most recent N entries
+    all_mem[ticker]["history"] = all_mem[ticker]["history"][-MAX_HISTORY_PER_TICKER:]
+    all_mem[ticker]["last_updated"] = entry["date"]
 
-    # Update price context
-    if ltp:
-        mem["price_context"]["last_known_ltp"] = ltp
-
-    mem["total_runs"]   += 1
-    mem["last_updated"]  = now
-
-    path = MEM_DIR / f"{ticker.upper()}.json"
-    path.write_text(json.dumps(mem, indent=2, default=str), encoding="utf-8")
-    logger.debug("Memory saved: {} → {} (streak: {})", ticker, rec, mem["consecutive_signal"])
-    return mem
+    _save_all(all_mem)
+    logger.info("agent_memory: recorded verdict for {} ({} total)", ticker, len(all_mem[ticker]["history"]))
 
 
-def update_outcome(ticker: str, outcome: str, pnl_pct: float = 0) -> None:
+def get_memory(ticker: str, last_n: int = 3) -> list:
+    """Return the last N verdicts for a ticker, most recent first."""
+    ticker = ticker.strip().upper()
+    all_mem = _load_all()
+    history = all_mem.get(ticker, {}).get("history", [])
+    return list(reversed(history))[:last_n]
+
+
+def summarize_memory(ticker: str, last_n: int = 3) -> str:
     """
-    Called by feedback_engine when a trade closes.
-    outcome: 'WIN' or 'LOSS' or 'STOPPED_OUT'
+    Build a short text summary of a ticker's recent verdict history,
+    formatted for injection into an agent's user_message context.
+    Returns empty string if no prior history exists.
     """
-    mem = load_memory(ticker)
-    mem["accuracy"]["total_evaluated"] += 1
-    if outcome == "WIN":
-        mem["accuracy"]["correct"] += 1
-    total = mem["accuracy"]["total_evaluated"]
-    if total > 0:
-        mem["accuracy"]["win_rate"] = round(mem["accuracy"]["correct"] / total * 100, 1)
+    history = get_memory(ticker, last_n)
+    if not history:
+        return ""
 
-    # Mark the most recent evaluated signal
-    for entry in mem["signal_history"]:
-        if entry.get("outcome") is None:
-            entry["outcome"]  = outcome
-            entry["pnl_pct"]  = pnl_pct
-            break
-
-    path = MEM_DIR / f"{ticker.upper()}.json"
-    path.write_text(json.dumps(mem, indent=2, default=str), encoding="utf-8")
-
-
-# ── Memory context for prompts ────────────────────────────────
-
-def get_memory_context(ticker: str) -> str:
-    """
-    Returns a formatted string to inject into the Research Manager prompt.
-    This gives the agent historical context about this stock.
-    """
-    mem = load_memory(ticker)
-
-    if mem["total_runs"] == 0:
-        return f"No prior analysis history for {ticker}. This is the first run."
-
-    lines = [f"PRIOR ANALYSIS HISTORY FOR {ticker}:"]
-
-    # Streak info
-    streak = mem["consecutive_signal"]
-    direc  = mem["consecutive_direction"]
-    if streak >= 2:
+    lines = [f"PRIOR HEDGEFUSION ANALYSES OF {ticker.upper()} (most recent first):"]
+    for i, h in enumerate(history, 1):
+        date_short = h.get("date", "")[:10]
         lines.append(
-            f"  ⚠️ STREAK: {streak} consecutive {direc} signals in a row. "
-            f"{'High conviction — trend confirming.' if streak >= 3 else 'Developing pattern.'}"
+            f"  {i}. [{date_short}] {h.get('recommendation','?')} "
+            f"(PM: {h.get('pm_decision','?')}, confidence: {h.get('confidence','?')}) "
+            f"— entry {h.get('entry_zone','?')}, SL {h.get('stop_loss','?')}, "
+            f"target {h.get('target1','?')}"
         )
-
-    # Regime
-    regime = mem["regime"]["current"]
-    flips  = mem["regime"]["flips"]
-    if regime:
-        lines.append(f"  Current regime: {regime} ({flips} regime changes in history)")
-
-    # Historical accuracy for this stock
-    acc = mem["accuracy"]
-    if acc["total_evaluated"] >= 3:
-        lines.append(
-            f"  Agent accuracy on {ticker}: {acc['win_rate']:.0f}% "
-            f"({acc['correct']}/{acc['total_evaluated']} correct calls)"
-        )
-
-    # Last 3 signals
-    hist = mem["signal_history"][:3]
-    if hist:
-        lines.append("  Recent signals:")
-        for h in hist:
-            ts    = h.get("timestamp","")[:10]
-            rec   = h.get("recommendation","?")
-            conf  = h.get("confidence","?")
-            pm    = h.get("pm_decision","?")
-            out   = h.get("outcome")
-            out_s = f" → {out}" if out else ""
-            lines.append(f"    {ts}: {rec} ({conf} confidence) PM:{pm}{out_s}")
-
-    # Price context
-    ltp = mem["price_context"].get("last_known_ltp")
-    if ltp:
-        lines.append(f"  Last known LTP: ₹{ltp:,.2f}")
-
-    lines.append("")
+        if h.get("key_thesis"):
+            lines.append(f"     Thesis: {h['key_thesis'][:150]}")
+    lines.append(
+        "  Consider whether the prior thesis still holds, or whether new data "
+        "changes the picture. Don't just repeat the last verdict without justification."
+    )
     return "\n".join(lines)
 
 
-def get_all_memory_summary() -> list[dict]:
-    """Get summary of all ticker memories for the dashboard."""
-    summaries = []
-    for path in sorted(MEM_DIR.glob("*.json")):
-        try:
-            mem = json.loads(path.read_text())
-            summaries.append({
-                "ticker":      mem.get("ticker",""),
-                "total_runs":  mem.get("total_runs",0),
-                "streak":      mem.get("consecutive_signal",0),
-                "direction":   mem.get("consecutive_direction",""),
-                "regime":      mem.get("regime",{}).get("current",""),
-                "win_rate":    mem.get("accuracy",{}).get("win_rate",0),
-                "evaluated":   mem.get("accuracy",{}).get("total_evaluated",0),
-                "last_signal": mem.get("signal_history",[{}])[0].get("recommendation","") if mem.get("signal_history") else "",
-                "last_run":    mem.get("last_updated","")[:10] if mem.get("last_updated") else "",
-                "flips":       mem.get("regime",{}).get("flips",0),
-            })
-        except Exception:
-            pass
-    return sorted(summaries, key=lambda x: x["total_runs"], reverse=True)
-
-
-def print_memory_report():
-    """Print all agent memories to terminal."""
-    summaries = get_all_memory_summary()
-    if not summaries:
-        print("No agent memory yet. Run python hf.py run TICKER first.")
+def clear_memory(ticker: Optional[str] = None) -> None:
+    """Clear memory for one ticker, or all tickers if ticker is None."""
+    if ticker is None:
+        _save_all({})
+        print("✅ Cleared all agent memory.")
         return
-    sep = "━" * 60
-    print(f"\n{sep}")
-    print(f"  AGENT MEMORY REPORT")
-    print(f"  {datetime.now().strftime('%d %b %Y %H:%M')}")
-    print(f"{sep}")
-    print(f"\n  {'Ticker':<14} {'Runs':>5} {'Signal':>6} {'Streak':>7} {'Win Rate':>9} {'Regime'}")
-    print(f"  {'─'*56}")
-    for s in summaries:
-        wr = f"{s['win_rate']:.0f}%" if s["evaluated"] >= 3 else "N/A"
-        streak_str = f"{s['streak']}× {s['direction']}" if s["direction"] else "—"
-        print(f"  {s['ticker']:<14} {s['total_runs']:>5} {s['last_signal']:>6} "
-              f"{streak_str:>7} {wr:>9} {s['regime']}")
-    print(f"\n{sep}\n")
+    ticker = ticker.strip().upper()
+    all_mem = _load_all()
+    if ticker in all_mem:
+        del all_mem[ticker]
+        _save_all(all_mem)
+        print(f"✅ Cleared memory for {ticker}.")
+    else:
+        print(f"No memory found for {ticker}.")
+
+
+def memory_stats() -> dict:
+    """Summary stats across the whole memory store."""
+    all_mem = _load_all()
+    total_verdicts = sum(len(v.get("history", [])) for v in all_mem.values())
+    most_analysed  = sorted(
+        all_mem.items(), key=lambda kv: len(kv[1].get("history", [])), reverse=True
+    )[:5]
+
+    return {
+        "tickers_tracked":  len(all_mem),
+        "total_verdicts":   total_verdicts,
+        "most_analysed": [
+            {"ticker": t, "runs": len(v.get("history", []))}
+            for t, v in most_analysed
+        ],
+    }
+
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+
+def _print_history(ticker: str):
+    history = get_memory(ticker, last_n=MAX_HISTORY_PER_TICKER)
+    if not history:
+        print(f"\n  No memory found for {ticker.upper()}.\n")
+        return
+
+    print(f"\n{'━'*60}")
+    print(f"  AGENT MEMORY — {ticker.upper()}")
+    print(f"  {len(history)} prior analyses")
+    print(f"{'━'*60}\n")
+    for i, h in enumerate(history, 1):
+        print(f"  [{i}] {h.get('date','')[:16]}")
+        print(f"      Rec: {h.get('recommendation','?'):<6} PM: {h.get('pm_decision','?'):<8} "
+              f"Confidence: {h.get('confidence','?')}")
+        print(f"      Entry: {h.get('entry_zone','?')}  SL: {h.get('stop_loss','?')}  "
+              f"Target: {h.get('target1','?')}  R:R: {h.get('risk_reward','?')}")
+        if h.get("key_thesis"):
+            print(f"      Thesis: {h['key_thesis'][:120]}")
+        if h.get("order_status"):
+            print(f"      Order: {h['order_status']}")
+        print()
+    print(f"{'━'*60}\n")
+
+
+def _print_stats():
+    stats = memory_stats()
+    print(f"\n{'━'*55}")
+    print(f"  AGENT MEMORY — SYSTEM STATS")
+    print(f"{'━'*55}")
+    print(f"  Tickers tracked:   {stats['tickers_tracked']}")
+    print(f"  Total verdicts:    {stats['total_verdicts']}")
+    if stats["most_analysed"]:
+        print(f"\n  Most analysed:")
+        for m in stats["most_analysed"]:
+            print(f"    {m['ticker']:<14} {m['runs']} runs")
+    print(f"{'━'*55}\n")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="HedgeFusion Agent Memory")
+    parser.add_argument("--ticker", help="Show memory for one ticker")
+    parser.add_argument("--clear",  action="store_true", help="Clear memory (for --ticker, or all if omitted)")
+    parser.add_argument("--stats",  action="store_true", help="Show memory-wide stats")
+    args = parser.parse_args()
+
+    if args.clear:
+        clear_memory(args.ticker)
+    elif args.stats:
+        _print_stats()
+    elif args.ticker:
+        _print_history(args.ticker)
+    else:
+        _print_stats()
 
 
 if __name__ == "__main__":
-    print_memory_report()
+    main()

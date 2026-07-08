@@ -1,464 +1,408 @@
 """
-HedgeFusion Analytics Engine
-==============================
-Computes professional portfolio performance metrics:
+HedgeFusion Analytics
+=======================
+Real portfolio performance metrics — beyond simple win rate.
 
-  XIRR  — Extended Internal Rate of Return
-           The correct return metric when you invest at different times.
-           e.g. SIP-style buying or irregular purchases.
-           More accurate than simple % return.
+  XIRR   — Extended Internal Rate of Return. Handles irregular cash
+           flows (you didn't invest a lump sum on day 1 — you bought
+           into positions at different times and sizes). This is the
+           ONLY correct way to measure annualised return for a real
+           trading account. Simple "total P&L / total invested" lies
+           when your capital was deployed at different times.
 
-  CAGR  — Compound Annual Growth Rate
-           Annualised return assuming you held from first purchase to today.
+  CAGR   — Compound Annual Growth Rate of realised + open equity.
 
-  Sharpe Ratio — Risk-adjusted return
-           (Portfolio return - Risk-free rate) / Portfolio volatility
-           India risk-free rate ≈ 7% (10Y G-Sec yield)
-           Sharpe > 1 = good, > 2 = excellent
+  Sharpe — Risk-adjusted return: (return - risk_free_rate) / volatility.
+           A high win rate with wild swings scores worse than a modest,
+           steady win rate — Sharpe captures that.
 
-  Alpha  — Portfolio outperformance vs Nifty 50
-           If Nifty returned 15% and your portfolio returned 22%, alpha = 7%.
-
-  Beta   — Portfolio sensitivity to Nifty 50 movements
-           Beta = 1.2 means your portfolio moves 1.2× the market
-
-  Max Drawdown — Largest peak-to-trough decline
-           Critical for understanding worst-case scenario
+  Benchmark — Your XIRR vs Nifty 50's return over the same period.
+           Are you actually beating the index, or would a Nifty ETF
+           have done better with zero effort?
 
 Usage:
-    python analytics.py              # full report
-    python analytics.py --xirr-only # just XIRR
-    from analytics import compute_xirr, compute_portfolio_analytics
+    python analytics.py                    # full report
+    python analytics.py --since 180        # last 180 days only
+
+Output: terminal + outputs/analytics_YYYYMMDD.html
 """
 
 import json
-import math
 import os
-import sys
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import yfinance as yf
 from dotenv import load_dotenv
 from loguru import logger
 
 load_dotenv(Path(__file__).parent / ".env")
 
-ROOT       = Path(__file__).parent
-DATA_DIR   = ROOT / "data"
-OUTPUT_DIR = ROOT / "outputs"
-LOG_DIR    = ROOT / "logs"
+OUTPUT_DIR = Path(__file__).parent / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+from config import PORTFOLIO_SIZE_INR
 
 
-# ── XIRR ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# XIRR — Newton's method on the NPV function
+# ──────────────────────────────────────────────
 
-def compute_xirr(
-    cashflows: list[tuple[date, float]],
-    guess: float = 0.1,
-) -> float:
+def _npv(rate: float, cashflows: list) -> float:
+    """Net present value of a list of (date, amount) cashflows at a given rate."""
+    if not cashflows:
+        return 0.0
+    t0 = cashflows[0][0]
+    total = 0.0
+    for date, amount in cashflows:
+        days = (date - t0).days
+        total += amount / ((1 + rate) ** (days / 365.0))
+    return total
+
+
+def _npv_derivative(rate: float, cashflows: list) -> float:
+    if not cashflows:
+        return 0.0
+    t0 = cashflows[0][0]
+    total = 0.0
+    for date, amount in cashflows:
+        days = (date - t0).days
+        years = days / 365.0
+        if years == 0:
+            continue
+        total += -years * amount / ((1 + rate) ** (years + 1))
+    return total
+
+
+def compute_xirr(cashflows: list, guess: float = 0.15, max_iter: int = 100, tol: float = 1e-6) -> float:
     """
-    Compute XIRR (Extended Internal Rate of Return).
+    Compute XIRR via Newton-Raphson iteration.
 
     Parameters
     ----------
-    cashflows : list of (date, amount) tuples
-        Negative amounts = money you paid out (purchases)
-        Positive amounts = money you received or current value
+    cashflows : list of (datetime, amount) tuples.
+                Negative amount = money going out (buy).
+                Positive amount = money coming in (sell / current value).
+    guess     : initial rate guess (15% default — reasonable equity starting point)
 
     Returns
     -------
-    float : XIRR as decimal (0.15 = 15%)
-
-    Example
-    -------
-    cashflows = [
-        (date(2025, 1, 15), -50000),   # bought ₹50,000 on 15 Jan 2025
-        (date(2025, 6, 10), -25000),   # added ₹25,000 on 10 Jun 2025
-        (date(2026, 6, 19), +92000),   # current value today
-    ]
-    xirr = compute_xirr(cashflows)
-    # → 0.384 = 38.4% XIRR
+    float: annualised rate as a decimal (0.18 = 18% p.a.), or 0.0 if it doesn't converge.
     """
-    if not cashflows or len(cashflows) < 2:
+    if len(cashflows) < 2:
         return 0.0
 
-    # Validate: need at least one negative and one positive
-    has_neg = any(cf < 0 for _, cf in cashflows)
-    has_pos = any(cf > 0 for _, cf in cashflows)
-    if not has_neg or not has_pos:
+    # Must have at least one negative and one positive cashflow
+    amounts = [c[1] for c in cashflows]
+    if not (any(a < 0 for a in amounts) and any(a > 0 for a in amounts)):
         return 0.0
 
-    dates = [cf[0] for cf in cashflows]
-    flows = [cf[1] for cf in cashflows]
-    base  = dates[0]
-
-    def xnpv(rate: float) -> float:
-        """Net Present Value at a given rate."""
-        if rate <= -1:
-            return float("inf")
-        return sum(
-            flows[i] / ((1 + rate) ** ((dates[i] - base).days / 365.0))
-            for i in range(len(flows))
-        )
-
-    def xnpv_deriv(rate: float) -> float:
-        """Derivative of XNPV for Newton-Raphson."""
-        if rate <= -1:
-            return float("inf")
-        return sum(
-            -flows[i] * ((dates[i] - base).days / 365.0)
-            / ((1 + rate) ** ((dates[i] - base).days / 365.0 + 1))
-            for i in range(len(flows))
-        )
-
-    # Newton-Raphson iteration
     rate = guess
-    for _ in range(200):
-        try:
-            npv  = xnpv(rate)
-            dnpv = xnpv_deriv(rate)
-            if abs(dnpv) < 1e-12:
-                break
-            new_rate = rate - npv / dnpv
-            if abs(new_rate - rate) < 1e-8:
-                return round(new_rate, 6)
-            rate = max(new_rate, -0.999)
-        except (ZeroDivisionError, OverflowError):
+    for _ in range(max_iter):
+        npv = _npv(rate, cashflows)
+        d_npv = _npv_derivative(rate, cashflows)
+        if abs(d_npv) < 1e-10:
             break
+        new_rate = rate - npv / d_npv
+        if abs(new_rate - rate) < tol:
+            return round(new_rate, 4)
+        # Guard against divergence
+        if new_rate < -0.99:
+            new_rate = -0.5
+        rate = new_rate
 
-    # Bisection fallback
-    try:
-        lo, hi = -0.999, 100.0
-        for _ in range(200):
-            mid = (lo + hi) / 2
-            if xnpv(mid) > 0:
-                lo = mid
-            else:
-                hi = mid
-            if hi - lo < 1e-8:
-                break
-        return round((lo + hi) / 2, 6)
-    except Exception:
-        return 0.0
+    return round(rate, 4) if abs(_npv(rate, cashflows)) < 1000 else 0.0
 
 
-def compute_cagr(
-    start_value: float,
-    end_value: float,
-    years: float,
-) -> float:
-    """
-    CAGR = (End Value / Start Value) ^ (1 / Years) - 1
+# ──────────────────────────────────────────────
+# CAGR
+# ──────────────────────────────────────────────
 
-    Parameters
-    ----------
-    start_value : Initial portfolio value
-    end_value   : Current portfolio value
-    years       : Holding period in years
-    """
+def compute_cagr(start_value: float, end_value: float, years: float) -> float:
+    """Compound Annual Growth Rate as a percentage."""
     if start_value <= 0 or years <= 0:
         return 0.0
     return round(((end_value / start_value) ** (1 / years) - 1) * 100, 2)
 
 
-# ── Portfolio analytics ───────────────────────────────────────
+# ──────────────────────────────────────────────
+# Sharpe ratio
+# ──────────────────────────────────────────────
 
-def compute_portfolio_analytics(
-    holdings: list[dict],
-    prices:   dict[str, dict] | None = None,
-) -> dict:
+def compute_sharpe(daily_returns: list, risk_free_rate_annual: float = 0.065) -> float:
     """
-    Compute complete portfolio analytics.
-
-    Parameters
-    ----------
-    holdings : List of holding dicts from config.py
-    prices   : Optional dict of {ticker: {ltp, prev, day_chg}} from data_exporter
+    Annualised Sharpe ratio from a list of daily returns (decimals, not %).
+    risk_free_rate_annual: India 10Y G-Sec yield proxy, ~6.5%.
     """
-    import yfinance as yf
-    import numpy as np
+    if not daily_returns or len(daily_returns) < 5:
+        return 0.0
 
-    today     = date.today()
-    tickers   = [h["ticker"] for h in holdings]
-    results   = {}
+    n = len(daily_returns)
+    mean_daily = sum(daily_returns) / n
+    variance   = sum((r - mean_daily) ** 2 for r in daily_returns) / n
+    std_daily  = variance ** 0.5
 
-    # ── Fetch historical prices ──────────────────────────────
-    logger.info("Fetching 1Y historical data for {} holdings...", len(tickers))
-    syms = [t.upper() + ".NS" for t in tickers]
+    if std_daily == 0:
+        return 0.0
+
+    rf_daily = risk_free_rate_annual / 252
+    sharpe_daily = (mean_daily - rf_daily) / std_daily
+    sharpe_annual = sharpe_daily * (252 ** 0.5)
+    return round(sharpe_annual, 2)
+
+
+# ──────────────────────────────────────────────
+# Benchmark comparison (vs Nifty 50)
+# ──────────────────────────────────────────────
+
+def get_nifty_return(start_date: datetime, end_date: datetime) -> dict:
+    """Nifty 50 return over the same period as your trades, for fair comparison."""
     try:
-        raw   = yf.download(syms + ["^NSEI"], period="1y", interval="1d",
-                            auto_adjust=True, progress=False, show_errors=False)
-        close = raw.get("Close", raw)
+        hist = yf.Ticker("^NSEI").history(
+            start=start_date.strftime("%Y-%m-%d"),
+            end=(end_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval="1d",
+        )
+        if hist is None or hist.empty:
+            return {"error": "no Nifty data"}
+
+        closes = hist["Close"].dropna()
+        start_px = float(closes.iloc[0])
+        end_px   = float(closes.iloc[-1])
+        ret_pct  = (end_px - start_px) / start_px * 100
+        years    = max((end_date - start_date).days / 365.0, 1/365)
+        cagr     = compute_cagr(start_px, end_px, years)
+
+        return {
+            "start_price": round(start_px, 2),
+            "end_price":   round(end_px, 2),
+            "return_pct":  round(ret_pct, 2),
+            "cagr_pct":    cagr,
+            "period_days": (end_date - start_date).days,
+        }
     except Exception as e:
-        logger.error("yfinance download failed: {}", e)
+        logger.warning("get_nifty_return failed: {}", e)
         return {"error": str(e)}
 
-    # ── XIRR cashflows ───────────────────────────────────────
-    # Build cashflows from config avg_buy_price
-    # (ideally from Zerodha trade history CSV — see notes below)
+
+# ──────────────────────────────────────────────
+# Main analytics builder
+# ──────────────────────────────────────────────
+
+def build_cashflow_series(trades: list, current_portfolio_value: float) -> list:
+    """
+    Convert a trade log into (date, amount) cashflow tuples for XIRR:
+      BUY  → negative cashflow (money leaving your pocket)
+      SELL → positive cashflow (money returning)
+      Final: add current portfolio value as a positive cashflow "today"
+             (as if you liquidated everything now) so XIRR reflects
+             realised + unrealised performance together.
+    """
     cashflows = []
-    total_inv  = 0
-    total_cur  = 0
+    for t in sorted(trades, key=lambda x: x["ts"]):
+        amount = t["value_inr"]
+        if t.get("transaction_type", "").upper() == "BUY":
+            cashflows.append((t["ts"], -amount))
+        elif t.get("transaction_type", "").upper() == "SELL":
+            cashflows.append((t["ts"], amount))
 
-    for h in holdings:
-        ticker = h["ticker"]
-        qty    = h.get("qty", 0)
-        avg    = h.get("avg_buy_price") or 0
+    if current_portfolio_value > 0:
+        cashflows.append((datetime.now(), current_portfolio_value))
 
-        if avg <= 0 or qty <= 0:
-            continue
+    return cashflows
 
-        # Purchase cashflow — negative (money out)
-        # We don't know exact purchase date, so estimate 1 year ago
-        # For accurate XIRR, import your actual Zerodha trade history
-        purchase_date = today - timedelta(days=365)
-        cashflows.append((purchase_date, -(qty * avg)))
-        total_inv += qty * avg
 
-        # Current value — positive (money in if you sold today)
-        if prices and ticker in prices:
-            ltp = prices[ticker].get("ltp", avg)
-        else:
-            sym = ticker.upper() + ".NS"
-            try:
-                ltp = float(close[sym].dropna().iloc[-1])
-            except Exception:
-                ltp = avg
-        total_cur += qty * ltp
+def run_analytics(since_days: int = 365) -> dict:
+    """
+    Full analytics run: XIRR, CAGR, Sharpe, Nifty benchmark comparison.
+    Pulls trade history from trade_journal and current portfolio from kite_execution.
+    """
+    from trade_journal import load_paper_trades, compute_stats
+    from tools.kite_execution import get_paper_portfolio
 
-    # Final cashflow: current portfolio value (positive)
-    if cashflows:
-        cashflows.append((today, total_cur))
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    ts_file   = datetime.now().strftime("%Y%m%d_%H%M")
 
-    xirr_val = compute_xirr(cashflows) if cashflows else 0
-    results["xirr_pct"]     = round(xirr_val * 100, 2)
-    results["total_inv"]    = round(total_inv, 2)
-    results["total_cur"]    = round(total_cur, 2)
-    results["abs_return"]   = round(total_cur - total_inv, 2)
-    results["simple_return"]= round((total_cur - total_inv) / total_inv * 100, 2) if total_inv else 0
+    print(f"\n{'━'*55}")
+    print(f"  HEDGEFUSION ANALYTICS")
+    print(f"  Period: last {since_days} days")
+    print(f"{'━'*55}\n")
 
-    # CAGR — assume 1 year holding
-    results["cagr_1y"] = compute_cagr(total_inv, total_cur, 1.0)
+    trades = load_paper_trades(since_days=since_days)
+    stats  = compute_stats(trades)
 
-    # ── Nifty 50 benchmark ───────────────────────────────────
+    if not trades:
+        print("  📭 No trades found. Run the pipeline with --execute first.\n")
+        return {"error": "no trades"}
+
+    # Current open portfolio value
     try:
-        nifty_close = close["^NSEI"].dropna()
-        nifty_start = float(nifty_close.iloc[0])
-        nifty_end   = float(nifty_close.iloc[-1])
-        nifty_ret   = (nifty_end - nifty_start) / nifty_start * 100
-        nifty_ret_1w= (nifty_close.iloc[-1]-nifty_close.iloc[-5])  / nifty_close.iloc[-5]  * 100 if len(nifty_close) >= 5  else 0
-        nifty_ret_1m= (nifty_close.iloc[-1]-nifty_close.iloc[-22]) / nifty_close.iloc[-22] * 100 if len(nifty_close) >= 22 else 0
-        nifty_ret_3m= (nifty_close.iloc[-1]-nifty_close.iloc[-65]) / nifty_close.iloc[-65] * 100 if len(nifty_close) >= 65 else 0
+        portfolio_raw = json.loads(get_paper_portfolio())
+        current_value = sum(p.get("current_inr", 0) for p in portfolio_raw.get("positions", []))
+    except Exception:
+        current_value = 0.0
 
-        results["nifty_ret_1y"]  = round(float(nifty_ret), 2)
-        results["nifty_ret_1w"]  = round(float(nifty_ret_1w), 2)
-        results["nifty_ret_1m"]  = round(float(nifty_ret_1m), 2)
-        results["nifty_ret_3m"]  = round(float(nifty_ret_3m), 2)
-        results["alpha_1y"]      = round(results["simple_return"] - results["nifty_ret_1y"], 2)
-        results["nifty_current"] = round(nifty_end, 2)
+    # XIRR
+    cashflows = build_cashflow_series(trades, current_value)
+    xirr = compute_xirr(cashflows)
+    xirr_pct = round(xirr * 100, 2)
 
-        # ── Beta calculation ─────────────────────────────────
-        portfolio_vals = []
-        nifty_vals     = close["^NSEI"].dropna()
-        for d in nifty_vals.index:
-            day_val = 0
-            for h in holdings:
-                sym = h["ticker"].upper() + ".NS"
-                try:
-                    p = float(close.loc[d, sym])
-                    day_val += h.get("qty",0) * p
-                except Exception:
-                    pass
-            portfolio_vals.append(day_val)
+    # CAGR (using total invested → total value across the observed period)
+    first_trade_date = min(t["ts"] for t in trades)
+    years_elapsed = max((datetime.now() - first_trade_date).days / 365.0, 1/365)
+    total_invested = stats.get("total_invested_inr", 0)
+    total_value    = total_invested + stats.get("total_pnl_inr", 0)
+    cagr = compute_cagr(total_invested, total_value, years_elapsed) if total_invested else 0
 
-        if len(portfolio_vals) >= 30:
-            port_arr   = [portfolio_vals[i]/portfolio_vals[i-1]-1 for i in range(1, len(portfolio_vals))]
-            nifty_arr  = nifty_vals.pct_change().dropna().tolist()
-            n          = min(len(port_arr), len(nifty_arr))
-            port_arr   = port_arr[-n:]
-            nifty_arr  = nifty_arr[-n:]
-            mean_p     = sum(port_arr) / n
-            mean_n     = sum(nifty_arr) / n
-            cov        = sum((port_arr[i]-mean_p)*(nifty_arr[i]-mean_n) for i in range(n)) / n
-            var_n      = sum((nifty_arr[i]-mean_n)**2 for i in range(n)) / n
-            beta       = cov / var_n if var_n else 1.0
+    # Sharpe — approximate from closed trade returns as a daily-return proxy
+    closed = stats.get("closed_trade_detail", [])
+    pseudo_daily_returns = [c["pnl_pct"] / 100 for c in closed] if closed else []
+    sharpe = compute_sharpe(pseudo_daily_returns)
 
-            # Sharpe ratio (India risk-free rate = 7%)
-            rf_daily   = 0.07 / 252
-            excess     = [r - rf_daily for r in port_arr]
-            mean_exc   = sum(excess) / len(excess)
-            std_exc    = (sum((x-mean_exc)**2 for x in excess) / len(excess)) ** 0.5
-            sharpe     = (mean_exc / std_exc) * (252 ** 0.5) if std_exc > 0 else 0
+    # Benchmark vs Nifty
+    nifty = get_nifty_return(first_trade_date, datetime.now())
 
-            # Max drawdown
-            peak = portfolio_vals[0]
-            max_dd = 0
-            for v in portfolio_vals:
-                if v > peak:
-                    peak = v
-                dd = (v - peak) / peak * 100
-                if dd < max_dd:
-                    max_dd = dd
+    result = {
+        "period_days":        since_days,
+        "first_trade_date":   first_trade_date.strftime("%Y-%m-%d"),
+        "years_elapsed":      round(years_elapsed, 2),
+        "xirr_pct":           xirr_pct,
+        "cagr_pct":           cagr,
+        "sharpe_ratio":       sharpe,
+        "total_invested_inr": total_invested,
+        "current_value_inr":  round(current_value, 2),
+        "realised_pnl_inr":   stats.get("total_pnl_inr", 0),
+        "win_rate_pct":       stats.get("win_rate_pct", 0),
+        "profit_factor":      stats.get("profit_factor", 0),
+        "closed_trades":      stats.get("closed_trades", 0),
+        "open_positions":     stats.get("open_positions", 0),
+        "nifty_benchmark":    nifty,
+        "alpha_vs_nifty_pct": round(xirr_pct - nifty.get("cagr_pct", 0), 2) if "error" not in nifty else None,
+    }
 
-            # Volatility (annualised)
-            mean_r = sum(port_arr) / len(port_arr)
-            vol    = (sum((r-mean_r)**2 for r in port_arr) / len(port_arr))**0.5 * (252**0.5) * 100
+    # Print
+    print(f"  First trade:       {result['first_trade_date']} ({result['years_elapsed']}y ago)")
+    print(f"  Total invested:    ₹{result['total_invested_inr']:,.0f}")
+    print(f"  Current value:     ₹{result['current_value_inr']:,.0f}")
+    print(f"  Realised P&L:      ₹{result['realised_pnl_inr']:,.0f}")
+    print(f"  {'─'*51}")
+    print(f"  XIRR:              {result['xirr_pct']:+.2f}% p.a.")
+    print(f"  CAGR:              {result['cagr_pct']:+.2f}% p.a.")
+    print(f"  Sharpe ratio:      {result['sharpe_ratio']:.2f}")
+    print(f"  Win rate:          {result['win_rate_pct']:.1f}%")
+    print(f"  Profit factor:     {result['profit_factor']:.2f}")
+    if "error" not in nifty:
+        print(f"  {'─'*51}")
+        print(f"  Nifty 50 CAGR:     {nifty['cagr_pct']:+.2f}% p.a. (same period)")
+        alpha = result["alpha_vs_nifty_pct"]
+        verdict = "✅ Beating Nifty" if alpha and alpha > 0 else "⚠️ Underperforming Nifty"
+        print(f"  Your alpha:        {alpha:+.2f}%  —  {verdict}")
+    print(f"{'━'*55}\n")
 
-            results["beta"]         = round(beta, 3)
-            results["sharpe"]       = round(sharpe, 3)
-            results["max_dd_pct"]   = round(max_dd, 2)
-            results["volatility_pct"]= round(vol, 2)
-        else:
-            results["beta"] = results["sharpe"] = results["max_dd_pct"] = results["volatility_pct"] = None
+    # HTML report
+    html = _build_analytics_html(result, timestamp)
+    html_path = OUTPUT_DIR / f"analytics_{ts_file}.html"
+    html_path.write_text(html, encoding="utf-8")
+    json_path = OUTPUT_DIR / f"analytics_{ts_file}.json"
+    json_path.write_text(json.dumps(result, default=str, indent=2), encoding="utf-8")
+    print(f"✅ Analytics report: {html_path}\n")
 
-    except Exception as e:
-        logger.warning("Benchmark calc failed: {}", e)
-        results["nifty_ret_1y"] = results["alpha_1y"] = results["beta"] = None
-
-    # ── Period returns ───────────────────────────────────────
-    period_rets = {}
-    for label, n_days in [("1W",5),("1M",22),("3M",65),("6M",130),("1Y",252)]:
-        try:
-            val_now  = 0
-            val_then = 0
-            for h in holdings:
-                sym = h["ticker"].upper() + ".NS"
-                col_close = close[sym].dropna()
-                if len(col_close) >= n_days:
-                    val_now  += h.get("qty",0) * float(col_close.iloc[-1])
-                    val_then += h.get("qty",0) * float(col_close.iloc[-n_days])
-            if val_then > 0:
-                period_rets[label] = round((val_now-val_then)/val_then*100, 2)
-        except Exception:
-            pass
-    results["period_returns"] = period_rets
-
-    # ── Per-stock contribution ───────────────────────────────
-    stock_contrib = []
-    for h in holdings:
-        ticker = h["ticker"]
-        sym    = ticker.upper() + ".NS"
-        qty    = h.get("qty", 0)
-        avg    = h.get("avg_buy_price") or 0
-        try:
-            col_close = close[sym].dropna()
-            ltp       = float(col_close.iloc[-1])
-            ret_1y    = float((col_close.iloc[-1]-col_close.iloc[0])/col_close.iloc[0]*100)
-            prev      = float(col_close.iloc[-2]) if len(col_close) >= 2 else ltp
-            day_ret   = (ltp - prev) / prev * 100
-            inv       = qty * avg
-            cur       = qty * ltp
-            pnl       = cur - inv if avg > 0 else 0
-            pnl_pct   = pnl / inv * 100 if inv > 0 else 0
-            stock_contrib.append({
-                "ticker":   ticker,
-                "sector":   h.get("sector",""),
-                "ltp":      round(ltp, 2),
-                "avg":      avg,
-                "qty":      qty,
-                "invested": round(inv, 2),
-                "current":  round(cur, 2),
-                "pnl":      round(pnl, 2),
-                "pnl_pct":  round(pnl_pct, 2),
-                "ret_1y":   round(ret_1y, 2),
-                "day_ret":  round(day_ret, 2),
-                "day_pnl":  round(qty * (ltp - prev), 2),
-                "weight":   round(cur / total_cur * 100, 1) if total_cur else 0,
-            })
-        except Exception:
-            pass
-
-    results["holdings"] = sorted(stock_contrib, key=lambda x: x["pnl"], reverse=True)
-
-    return results
+    return result
 
 
-def print_analytics_report(r: dict):
-    """Print a formatted analytics report to terminal."""
-    sep = "━" * 60
-    print(f"\n{sep}")
-    print(f"  HEDGEFUSION PORTFOLIO ANALYTICS")
-    print(f"  {datetime.now().strftime('%d %b %Y %H:%M IST')}")
-    print(sep)
+def _build_analytics_html(r: dict, timestamp: str) -> str:
+    def kpi(label, value, color="#f59e0b", sub=""):
+        return f"""<div style="background:#0f172a;border:1px solid #1e293b;
+                               border-radius:8px;padding:18px;text-align:center">
+          <div style="font-size:26px;font-weight:800;color:{color}">{value}</div>
+          <div style="font-size:11px;color:#64748b;margin-top:3px">{label}</div>
+          {"<div style='font-size:10px;color:#475569;margin-top:2px'>"+sub+"</div>" if sub else ""}
+        </div>"""
 
-    def fmt(n): return f"₹{abs(n):,.0f}" if n is not None else "N/A"
-    def sgn(n): return (f"+₹{n:,.0f}" if n>=0 else f"-₹{abs(n):,.0f}") if n is not None else "N/A"
-    def pct(n): return (f"{n:+.2f}%" if n is not None else "N/A")
-    def col(n): return "✅" if (n or 0) >= 0 else "🔴"
+    xirr_color = "#22c55e" if r["xirr_pct"] >= 0 else "#ef4444"
+    sharpe_color = "#22c55e" if r["sharpe_ratio"] >= 1 else "#f59e0b" if r["sharpe_ratio"] >= 0 else "#ef4444"
+    nifty = r.get("nifty_benchmark", {})
+    alpha = r.get("alpha_vs_nifty_pct")
+    alpha_color = "#22c55e" if alpha and alpha > 0 else "#ef4444"
 
-    print(f"\n  RETURNS")
-    print(f"  Invested:       {fmt(r.get('total_inv',0))}")
-    print(f"  Current value:  {fmt(r.get('total_cur',0))}")
-    print(f"  Absolute P&L:   {sgn(r.get('abs_return',0))} {col(r.get('abs_return'))}")
-    print(f"  Simple return:  {pct(r.get('simple_return'))}")
-    print(f"  XIRR (annlsd):  {pct(r.get('xirr_pct'))} ← most accurate metric")
-    print(f"  CAGR (1Y):      {pct(r.get('cagr_1y'))}")
+    kpi_row = f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:24px">
+      {kpi("XIRR (annualised)", f"{r['xirr_pct']:+.1f}%", xirr_color, "money-weighted return")}
+      {kpi("CAGR", f"{r['cagr_pct']:+.1f}%", xirr_color)}
+      {kpi("Sharpe Ratio", f"{r['sharpe_ratio']:.2f}", sharpe_color, "risk-adjusted")}
+      {kpi("Win Rate", f"{r['win_rate_pct']:.0f}%", "#60a5fa")}
+    </div>"""
 
-    print(f"\n  BENCHMARK (vs Nifty 50)")
-    print(f"  Portfolio 1Y:   {pct(r.get('simple_return'))}")
-    print(f"  Nifty 50 1Y:    {pct(r.get('nifty_ret_1y'))}")
-    alpha = r.get('alpha_1y')
-    print(f"  Alpha:          {pct(alpha)} {'✅ beating market' if (alpha or 0)>0 else '🔴 underperforming'}")
+    benchmark_html = ""
+    if "error" not in nifty:
+        benchmark_html = f"""
+        <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:20px">
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;text-align:center">
+            <div>
+              <div style="font-size:22px;font-weight:800;color:{xirr_color}">{r['xirr_pct']:+.1f}%</div>
+              <div style="font-size:11px;color:#64748b">Your XIRR</div>
+            </div>
+            <div>
+              <div style="font-size:22px;font-weight:800;color:#94a3b8">{nifty['cagr_pct']:+.1f}%</div>
+              <div style="font-size:11px;color:#64748b">Nifty 50 CAGR</div>
+            </div>
+            <div>
+              <div style="font-size:22px;font-weight:800;color:{alpha_color}">{alpha:+.1f}%</div>
+              <div style="font-size:11px;color:#64748b">Your Alpha</div>
+            </div>
+          </div>
+        </div>"""
+    else:
+        benchmark_html = "<div style='color:#64748b;padding:20px'>Nifty benchmark unavailable.</div>"
 
-    print(f"\n  PERIOD RETURNS")
-    for period, ret in r.get("period_returns", {}).items():
-        nifty_k = f"nifty_ret_{period.lower()}"
-        nifty_r = r.get(nifty_k)
-        vs = f"  (Nifty: {pct(nifty_r)})" if nifty_r is not None else ""
-        print(f"  {period}:            {pct(ret)}{vs}")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><title>HedgeFusion Analytics — {timestamp}</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#050d1a;color:#e2e8f0;margin:0;padding:20px}}
+  .wrap{{max-width:900px;margin:0 auto}}
+  h1{{font-size:22px;font-weight:800;color:#f8fafc;margin-bottom:4px}}
+  h2{{font-size:15px;font-weight:700;color:#e2e8f0;margin:28px 0 12px;
+      padding-bottom:8px;border-bottom:1px solid #1e293b}}
+  .meta{{font-size:12px;color:#64748b;margin-bottom:24px}}
+  .explain{{background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:18px;
+            font-size:13px;color:#94a3b8;line-height:1.7;margin-bottom:16px}}
+  .disc{{background:#1e1a0a;border:1px solid #78350f;border-radius:8px;
+         padding:14px 18px;font-size:12px;color:#92400e;margin-top:24px}}
+</style>
+</head>
+<body><div class="wrap">
+  <h1>📊 HedgeFusion Analytics</h1>
+  <div class="meta">{timestamp} &nbsp;·&nbsp; First trade: {r['first_trade_date']} ({r['years_elapsed']}y ago)</div>
 
-    print(f"\n  RISK METRICS")
-    print(f"  Beta vs Nifty:  {r.get('beta','N/A')} {'(aggressive)' if (r.get('beta') or 0) > 1.2 else '(defensive)' if (r.get('beta') or 0) < 0.8 else '(moderate)'}")
-    print(f"  Sharpe ratio:   {r.get('sharpe','N/A')} {'✅ good' if (r.get('sharpe') or 0) > 1 else '⚠️ below 1'}")
-    print(f"  Max drawdown:   {r.get('max_dd_pct','N/A')}%")
-    print(f"  Volatility:     {r.get('volatility_pct','N/A')}% annualised")
+  {kpi_row}
 
-    print(f"\n  PER-STOCK P&L")
-    for h in r.get("holdings", []):
-        avg_str = f"avg ₹{h['avg']:,.0f}" if h.get("avg") else "no avg"
-        print(f"  {h['ticker']:<14} {pct(h['pnl_pct']):>8}  ({avg_str})")
+  <h2>vs Nifty 50 Benchmark</h2>
+  {benchmark_html}
 
-    print(f"\n{sep}\n")
+  <h2>What these numbers mean</h2>
+  <div class="explain">
+    <b>XIRR</b> accounts for exactly when each rupee entered or left your account —
+    the correct way to measure return when you didn't invest a lump sum on day one.<br><br>
+    <b>Sharpe Ratio</b> above 1.0 is considered good, above 2.0 is excellent.
+    It penalises volatility — a bumpy path to the same return scores lower.<br><br>
+    <b>Alpha vs Nifty</b> is the return you generated beyond what a passive
+    Nifty 50 index fund would have delivered over the same period, with zero effort.
+  </div>
 
-
-def save_analytics(r: dict):
-    """Save analytics to data/analytics.json."""
-    out = DATA_DIR / "analytics.json"
-    DATA_DIR.mkdir(exist_ok=True)
-    r["computed_at"] = datetime.now().isoformat()
-    out.write_text(json.dumps(r, indent=2, default=str), encoding="utf-8")
-    print(f"✅ Analytics saved: {out}")
+  <div class="disc">
+    ⚠️ Based on paper trading data. Past performance does not guarantee future results.
+    XIRR/CAGR/Sharpe assume trade log accuracy — verify against your actual Zerodha
+    contract notes before making capital allocation decisions.
+  </div>
+</div></body></html>"""
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="HedgeFusion Analytics")
-    parser.add_argument("--xirr-only", action="store_true")
-    parser.add_argument("--save",      action="store_true", help="Save to data/analytics.json")
+    parser.add_argument("--since", type=int, default=365, help="Days of history (default 365)")
     args = parser.parse_args()
-
-    from config import HOLDINGS
-
-    if args.xirr_only:
-        # Quick XIRR only
-        from data_exporter import fetch_live_prices
-        prices = fetch_live_prices([h["ticker"] for h in HOLDINGS])
-        today  = date.today()
-        cfs = []
-        total_cur = 0
-        for h in HOLDINGS:
-            avg = h.get("avg_buy_price") or 0
-            qty = h.get("qty") or 0
-            if avg <= 0 or qty <= 0:
-                continue
-            cfs.append((today - timedelta(days=365), -(qty * avg)))
-            ltp = prices.get(h["ticker"],{}).get("ltp", avg)
-            total_cur += qty * ltp
-        if cfs:
-            cfs.append((today, total_cur))
-        xirr = compute_xirr(cfs)
-        print(f"\nXIRR: {xirr*100:.2f}%\n")
-    else:
-        r = compute_portfolio_analytics(HOLDINGS)
-        print_analytics_report(r)
-        if args.save:
-            save_analytics(r)
+    run_analytics(since_days=args.since)

@@ -1,39 +1,45 @@
 """
 HedgeFusion Feedback Engine
 ==============================
-Tracks what happened after each AI recommendation.
+Closes the loop: was the AI actually right?
 
-After the pipeline says SELL on ICICIBANK at ₹1,358:
-  - Was the agent right? Did the price go down?
-  - Did it hit the target? Or did it hit the stop loss?
-  - What was the actual return?
+The trade journal tells you WHAT happened (win rate, P&L).
+The feedback engine tells you whether the AGENT'S CONFIDENCE was
+CALIBRATED — did "HIGH confidence BUY" calls actually win more often
+than "LOW confidence BUY" calls? If not, the confidence field is
+decorative, not predictive, and that's a real problem worth knowing.
 
-This feedback is stored and fed back into:
-  1. Agent memory (win_rate per ticker)
-  2. The multibagger screener (adjust scoring for stocks AI is accurate on)
-  3. The Research Manager prompt (context: "AI has been 70% accurate on ICICIBANK")
-  4. The dashboard (show actual vs predicted performance)
+What it computes:
 
-Evaluation logic:
-  For SELL signals:
-    WIN  = price fell below target within holding period
-    LOSS = price rose above stop loss
-    OPEN = neither hit yet (still in holding period)
+  1. OUTCOME MATCHING
+     For every closed paper trade, finds the pipeline run that
+     generated it (matched by ticker + nearest date) and records
+     whether the trade won or lost.
 
-  For BUY signals:
-    WIN  = price rose above target within holding period
-    LOSS = price fell below stop loss
-    OPEN = neither hit yet
+  2. CONFIDENCE CALIBRATION
+     Groups closed trades by the Research Manager's stated confidence
+     (HIGH / MEDIUM / LOW) and computes actual win rate per bucket.
+     Well-calibrated: HIGH confidence wins more than LOW confidence.
+     Miscalibrated: no difference, or inverted — confidence is noise.
 
-  Holding period: 30 trading days (configurable)
+  3. RECOMMENDATION ACCURACY
+     BUY calls that were followed → did they go up?
+     SELL calls that were followed → did they go down?
+     HOLD/VETO calls → did the stock avoid a large drawdown
+       (i.e. was blocking it the right call)?
+
+  4. VETO EFFECTIVENESS
+     Of all Portfolio Manager VETOs, how many would have been losing
+     trades if executed? (Estimated using price movement since the
+     verdict date, even though no order was placed.)
 
 Usage:
-    python feedback_engine.py              # evaluate all open signals
-    python feedback_engine.py --report     # show accuracy report
-    python feedback_engine.py --ticker ICICIBANK  # one stock
+    python feedback_engine.py              # full calibration report
+    python feedback_engine.py --since 180  # last 180 days
+
+Output: terminal + outputs/feedback_YYYYMMDD.html
 """
 
-import csv
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -44,375 +50,348 @@ from loguru import logger
 
 load_dotenv(Path(__file__).parent / ".env")
 
-ROOT       = Path(__file__).parent
-DATA_DIR   = ROOT / "data"
-FB_DIR     = DATA_DIR / "feedback"
-MEM_DIR    = DATA_DIR / "memory"
-OUTPUT_DIR = ROOT / "outputs"
-LOG_DIR    = ROOT / "logs"
-PAPER_LOG  = LOG_DIR / "paper_trades.csv"
-
-FB_DIR.mkdir(parents=True, exist_ok=True)
-OUTCOMES_FILE = FB_DIR / "outcomes.json"
-HOLDING_DAYS  = 30   # evaluate after 30 trading days
+OUTPUT_DIR = Path(__file__).parent / "outputs"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-# ── Load / save outcomes ──────────────────────────────────────
+# ──────────────────────────────────────────────
+# Data loading
+# ──────────────────────────────────────────────
 
-def load_outcomes() -> dict:
-    if OUTCOMES_FILE.exists():
+def _load_pipeline_outputs(since_days: int = 365) -> list:
+    """Load all pipeline JSON outputs (same source as trade_journal)."""
+    cutoff = datetime.now() - timedelta(days=since_days)
+    outputs = []
+    for p in OUTPUT_DIR.glob("*.json"):
+        # Skip our own reports (analytics_, feedback_, portfolio_, watchlist_, etc.)
+        if p.stem.split("_")[0].islower():
+            continue
         try:
-            return json.loads(OUTCOMES_FILE.read_text(encoding="utf-8"))
+            mtime = datetime.fromtimestamp(p.stat().st_mtime)
+            if mtime < cutoff:
+                continue
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "ticker" in data and "research_verdict" in data:
+                outputs.append(data)
         except Exception:
             pass
-    return {}
+    return outputs
 
 
-def save_outcomes(outcomes: dict) -> None:
-    OUTCOMES_FILE.write_text(
-        json.dumps(outcomes, indent=2, default=str), encoding="utf-8"
-    )
-
-
-# ── Price fetcher ─────────────────────────────────────────────
-
-def get_price_at(ticker: str, target_date: datetime) -> float | None:
-    """Get the closing price of a stock on or after a given date."""
+def _get_forward_return(ticker: str, from_date: datetime, days_forward: int = 30) -> float:
+    """
+    Actual price return for a ticker over N days following a verdict date.
+    Used to check if BUY/SELL/HOLD calls were directionally correct,
+    independent of whether a paper trade was actually placed.
+    """
+    symbol = ticker.upper()
+    if not symbol.endswith(".NS"):
+        symbol += ".NS"
     try:
-        sym  = ticker.upper() + ".NS"
-        t    = yf.Ticker(sym)
-        start= target_date - timedelta(days=3)
-        end  = target_date + timedelta(days=5)
-        hist = t.history(start=start.strftime("%Y-%m-%d"),
-                         end=end.strftime("%Y-%m-%d"), interval="1d")
-        if hist is None or hist.empty:
-            return None
-        return float(hist["Close"].iloc[0])
-    except Exception:
-        return None
-
-
-def get_current_price(ticker: str) -> float | None:
-    """Get current LTP."""
-    try:
-        sym  = ticker.upper() + ".NS"
-        hist = yf.Ticker(sym).history(period="2d", interval="1d")
-        if hist is None or hist.empty:
-            return None
-        return float(hist["Close"].iloc[-1])
-    except Exception:
-        return None
-
-
-def get_price_range(ticker: str, start: datetime, end: datetime) -> dict:
-    """Get high/low/close range between two dates."""
-    try:
-        sym  = ticker.upper() + ".NS"
-        hist = yf.Ticker(sym).history(
+        start = from_date - timedelta(days=3)
+        end   = from_date + timedelta(days=days_forward + 3)
+        hist  = yf.Ticker(symbol).history(
             start=start.strftime("%Y-%m-%d"),
             end=end.strftime("%Y-%m-%d"),
             interval="1d",
         )
         if hist is None or hist.empty:
-            return {}
-        return {
-            "high":  float(hist["High"].max()),
-            "low":   float(hist["Low"].min()),
-            "close": float(hist["Close"].iloc[-1]),
-            "days":  len(hist),
-        }
-    except Exception:
-        return {}
+            return None
+
+        hist.index = hist.index.tz_localize(None)
+        # Price nearest to verdict date
+        before = hist[hist.index <= from_date]
+        after  = hist[hist.index >= from_date + timedelta(days=days_forward)]
+        if before.empty:
+            return None
+
+        start_px = float(before["Close"].iloc[-1])
+        end_px   = float(after["Close"].iloc[0]) if not after.empty else float(hist["Close"].iloc[-1])
+
+        return round((end_px - start_px) / start_px * 100, 2)
+    except Exception as e:
+        logger.warning("_get_forward_return({}) failed: {}", ticker, e)
+        return None
 
 
-# ── Read signals from pipeline outputs ───────────────────────
+# ──────────────────────────────────────────────
+# Calibration analysis
+# ──────────────────────────────────────────────
 
-def read_pipeline_signals() -> list[dict]:
-    """Read all pipeline JSON outputs and extract signal data."""
-    signals = []
-    for path in OUTPUT_DIR.glob("*.json"):
+def compute_confidence_calibration(pipeline_outputs: list, forward_days: int = 30) -> dict:
+    """
+    For each pipeline run with a BUY/SELL recommendation, check the
+    actual forward return and bucket by stated confidence level.
+    """
+    buckets = {"HIGH": [], "MEDIUM": [], "LOW": []}
+
+    for state in pipeline_outputs:
+        rv = state.get("research_verdict", {})
+        rec = rv.get("recommendation", "")
+        conf = str(rv.get("confidence", "")).upper()
+        if rec not in ("BUY", "SELL") or conf not in buckets:
+            continue
+
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or "ticker" not in data:
-                continue
-            rv  = data.get("research_verdict") or {}
-            pm  = data.get("pm_decision") or {}
-            ex  = data.get("execution_result") or {}
-            rec = rv.get("recommendation","")
-            if rec not in ("BUY","SELL"):
-                continue
-            mtime = datetime.fromtimestamp(path.stat().st_mtime)
-            signals.append({
-                "id":            path.stem,
-                "ticker":        data.get("ticker",""),
-                "run_date":      mtime,
-                "recommendation":rec,
-                "confidence":    rv.get("confidence",""),
-                "entry_price":   ex.get("fill_price") or rv.get("entry_price"),
-                "stop_loss":     rv.get("stop_loss"),
-                "target1":       rv.get("target1"),
-                "risk_reward":   rv.get("risk_reward",""),
-                "pm_decision":   pm.get("decision",""),
-                "order_id":      ex.get("order_id",""),
-            })
+            verdict_date = datetime.fromisoformat(state.get("completed_at", ""))
         except Exception:
-            pass
-    signals.sort(key=lambda x: x["run_date"])
-    return signals
+            continue
+
+        # Don't evaluate verdicts too recent to have forward data
+        if (datetime.now() - verdict_date).days < forward_days:
+            continue
+
+        fwd_ret = _get_forward_return(state["ticker"], verdict_date, forward_days)
+        if fwd_ret is None:
+            continue
+
+        # For a BUY: correct if price went up. For a SELL: correct if price went down.
+        correct = (fwd_ret > 0) if rec == "BUY" else (fwd_ret < 0)
+
+        buckets[conf].append({
+            "ticker": state["ticker"],
+            "recommendation": rec,
+            "forward_return_pct": fwd_ret,
+            "correct": correct,
+        })
+
+    calibration = {}
+    for level, results in buckets.items():
+        if not results:
+            calibration[level] = {"n": 0, "hit_rate_pct": None, "avg_return_pct": None}
+            continue
+        hits = sum(1 for r in results if r["correct"])
+        calibration[level] = {
+            "n": len(results),
+            "hit_rate_pct": round(hits / len(results) * 100, 1),
+            "avg_return_pct": round(sum(r["forward_return_pct"] for r in results) / len(results), 2),
+            "detail": results,
+        }
+
+    return calibration
 
 
-# ── Evaluate a single signal ──────────────────────────────────
-
-def evaluate_signal(signal: dict, outcomes: dict) -> dict | None:
+def compute_veto_effectiveness(pipeline_outputs: list, forward_days: int = 30) -> dict:
     """
-    Evaluate whether a signal was correct.
-    Returns outcome dict or None if still open / insufficient data.
+    For every PM VETO, check what the stock actually did afterward.
+    A good veto blocked a trade that would have lost money.
+    A bad veto blocked a trade that would have won — an opportunity cost.
     """
-    sig_id = signal["id"]
-    if sig_id in outcomes and outcomes[sig_id].get("outcome") not in (None, "OPEN"):
-        return outcomes[sig_id]   # already evaluated
+    vetoes = []
+    for state in pipeline_outputs:
+        pm = state.get("pm_decision", {})
+        rv = state.get("research_verdict", {})
+        if pm.get("decision") != "VETO":
+            continue
 
-    ticker   = signal["ticker"]
-    rec      = signal["recommendation"]
-    run_date = signal["run_date"]
-    entry    = signal.get("entry_price")
-    sl       = signal.get("stop_loss")
-    tgt      = signal.get("target1")
+        try:
+            verdict_date = datetime.fromisoformat(state.get("completed_at", ""))
+        except Exception:
+            continue
+        if (datetime.now() - verdict_date).days < forward_days:
+            continue
 
-    if not entry or not sl or not tgt:
-        return None
+        fwd_ret = _get_forward_return(state["ticker"], verdict_date, forward_days)
+        if fwd_ret is None:
+            continue
 
-    entry = float(entry)
-    sl    = float(sl)
-    tgt   = float(tgt)
+        # What would have happened if the (blocked) BUY/SELL had gone through?
+        rec = rv.get("recommendation", "HOLD")
+        would_have_won = (fwd_ret > 0) if rec == "BUY" else (fwd_ret < 0) if rec == "SELL" else None
 
-    # Holding period end
-    eval_date = run_date + timedelta(days=HOLDING_DAYS * 1.4)  # ~30 trading days
-    now       = datetime.now()
+        vetoes.append({
+            "ticker":            state["ticker"],
+            "recommendation":    rec,
+            "forward_return_pct": fwd_ret,
+            "veto_was_correct":  would_have_won is False if would_have_won is not None else None,
+            "pm_note":           (pm.get("pm_note") or "")[:100],
+        })
 
-    if now < run_date + timedelta(days=3):
-        # Too early to evaluate
-        return {"outcome": "OPEN", "signal_id": sig_id, "ticker": ticker}
+    good_vetoes = [v for v in vetoes if v["veto_was_correct"] is True]
+    bad_vetoes  = [v for v in vetoes if v["veto_was_correct"] is False]
 
-    # Get price range from signal date to eval date
-    end_dt   = min(eval_date, now)
-    pr       = get_price_range(ticker, run_date, end_dt)
-    if not pr:
-        return None
+    return {
+        "total_vetoes":       len(vetoes),
+        "good_vetoes":        len(good_vetoes),
+        "bad_vetoes":         len(bad_vetoes),
+        "veto_accuracy_pct":  round(len(good_vetoes) / len(vetoes) * 100, 1) if vetoes else None,
+        "detail":             vetoes,
+    }
 
-    high  = pr.get("high", 0)
-    low   = pr.get("low",  999999)
-    close = pr.get("close", entry)
-    days  = pr.get("days", 0)
 
-    # Still within holding period and neither SL nor target hit
-    if now < eval_date:
-        # Check if SL or target already hit
-        if rec == "BUY":
-            if low <= sl:
-                outcome = "STOPPED_OUT"
-                pnl_pct = (sl - entry) / entry * 100
-            elif high >= tgt:
-                outcome = "WIN"
-                pnl_pct = (tgt - entry) / entry * 100
-            else:
-                return {"outcome": "OPEN", "signal_id": sig_id, "ticker": ticker,
-                        "days_held": days, "current_pnl": (close - entry)/entry*100}
-        else:  # SELL
-            if high >= sl:
-                outcome = "STOPPED_OUT"
-                pnl_pct = (entry - sl) / entry * 100  # loss for short
-            elif low <= tgt:
-                outcome = "WIN"
-                pnl_pct = (entry - tgt) / entry * 100
-            else:
-                return {"outcome": "OPEN", "signal_id": sig_id, "ticker": ticker,
-                        "days_held": days, "current_pnl": (entry - close)/entry*100}
-    else:
-        # Holding period over — evaluate based on close
-        if rec == "BUY":
-            pnl_pct = (close - entry) / entry * 100
-            outcome = "WIN" if close >= tgt else "LOSS" if close <= sl else ("WIN" if pnl_pct > 0 else "LOSS")
+# ──────────────────────────────────────────────
+# Main runner
+# ──────────────────────────────────────────────
+
+def run_feedback_engine(since_days: int = 365, forward_days: int = 30) -> dict:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M IST")
+    ts_file   = datetime.now().strftime("%Y%m%d_%H%M")
+
+    print(f"\n{'━'*60}")
+    print(f"  HEDGEFUSION FEEDBACK ENGINE")
+    print(f"  Checking {forward_days}-day forward outcomes for all past verdicts")
+    print(f"{'━'*60}\n")
+
+    outputs = _load_pipeline_outputs(since_days)
+    print(f"  Pipeline runs found: {len(outputs)}")
+
+    eligible = [
+        o for o in outputs
+        if (datetime.now() - datetime.fromisoformat(o.get("completed_at", datetime.now().isoformat()))).days >= forward_days
+    ]
+    print(f"  Eligible for {forward_days}-day evaluation: {len(eligible)}")
+    print(f"  (Verdicts newer than {forward_days} days can't be scored yet)\n")
+
+    if not eligible:
+        print(f"  📭 No verdicts old enough to evaluate yet. Run the pipeline more,")
+        print(f"     wait {forward_days} days, then re-run this report.\n")
+        return {"error": "insufficient aged data", "total_runs": len(outputs)}
+
+    print("  Computing confidence calibration...")
+    calibration = compute_confidence_calibration(outputs, forward_days)
+
+    print("  Computing veto effectiveness...")
+    veto_stats = compute_veto_effectiveness(outputs, forward_days)
+
+    # Print summary
+    print(f"\n{'━'*60}")
+    print(f"  CONFIDENCE CALIBRATION ({forward_days}-day forward return)")
+    print(f"{'━'*60}")
+    for level in ["HIGH", "MEDIUM", "LOW"]:
+        c = calibration.get(level, {})
+        if c.get("n", 0) == 0:
+            print(f"  {level:<8} — no scored calls yet")
+            continue
+        print(f"  {level:<8} n={c['n']:<4} hit_rate={c['hit_rate_pct']}%  "
+              f"avg_fwd_return={c['avg_return_pct']:+.2f}%")
+
+    hi = calibration.get("HIGH", {}).get("hit_rate_pct")
+    lo = calibration.get("LOW", {}).get("hit_rate_pct")
+    if hi is not None and lo is not None:
+        if hi > lo:
+            print(f"\n  ✅ Well-calibrated: HIGH confidence ({hi}%) beats LOW confidence ({lo}%)")
         else:
-            pnl_pct = (entry - close) / entry * 100
-            outcome = "WIN" if close <= tgt else "LOSS" if close >= sl else ("WIN" if pnl_pct > 0 else "LOSS")
+            print(f"\n  ⚠️ Poorly calibrated: HIGH confidence ({hi}%) does NOT beat LOW ({lo}%)")
+            print(f"     Confidence field may not be predictive — treat with caution.")
+
+    print(f"\n{'━'*60}")
+    print(f"  PORTFOLIO MANAGER VETO EFFECTIVENESS")
+    print(f"{'━'*60}")
+    print(f"  Total vetoes evaluated: {veto_stats['total_vetoes']}")
+    if veto_stats["total_vetoes"]:
+        print(f"  Correct vetoes:  {veto_stats['good_vetoes']} "
+              f"(blocked a trade that would have lost)")
+        print(f"  Bad vetoes:      {veto_stats['bad_vetoes']} "
+              f"(blocked a trade that would have won — opportunity cost)")
+        print(f"  Veto accuracy:   {veto_stats['veto_accuracy_pct']}%")
+    print(f"{'━'*60}\n")
 
     result = {
-        "signal_id":      sig_id,
-        "ticker":         ticker,
-        "recommendation": rec,
-        "confidence":     signal.get("confidence",""),
-        "risk_reward":    signal.get("risk_reward",""),
-        "run_date":       run_date.isoformat(),
-        "entry_price":    entry,
-        "stop_loss":      sl,
-        "target1":        tgt,
-        "high_in_period": high,
-        "low_in_period":  low,
-        "close_at_eval":  close,
-        "days_held":      days,
-        "outcome":        outcome,
-        "pnl_pct":        round(pnl_pct, 2),
-        "evaluated_at":   now.isoformat(),
+        "since_days":         since_days,
+        "forward_days":       forward_days,
+        "total_runs":         len(outputs),
+        "eligible_runs":      len(eligible),
+        "confidence_calibration": calibration,
+        "veto_effectiveness": veto_stats,
     }
+
+    html = _build_feedback_html(result, timestamp)
+    html_path = OUTPUT_DIR / f"feedback_{ts_file}.html"
+    html_path.write_text(html, encoding="utf-8")
+    json_path = OUTPUT_DIR / f"feedback_{ts_file}.json"
+    json_path.write_text(json.dumps(result, default=str, indent=2), encoding="utf-8")
+    print(f"✅ Feedback report: {html_path}\n")
+
     return result
 
 
-# ── Accuracy report ───────────────────────────────────────────
+def _build_feedback_html(r: dict, timestamp: str) -> str:
+    cal = r.get("confidence_calibration", {})
+    veto = r.get("veto_effectiveness", {})
 
-def compute_accuracy(outcomes: dict) -> dict:
-    """Compute overall and per-ticker accuracy from all outcomes."""
-    closed = [v for v in outcomes.values()
-              if isinstance(v, dict) and v.get("outcome") not in (None,"OPEN")]
+    cal_rows = ""
+    for level in ["HIGH", "MEDIUM", "LOW"]:
+        c = cal.get(level, {})
+        n = c.get("n", 0)
+        hr = c.get("hit_rate_pct")
+        ar = c.get("avg_return_pct")
+        color = "#22c55e" if hr and hr >= 55 else "#f59e0b" if hr and hr >= 45 else "#ef4444" if hr is not None else "#64748b"
+        cal_rows += f"""<tr>
+          <td style="font-weight:700">{level}</td>
+          <td>{n}</td>
+          <td style="color:{color};font-weight:600">{f'{hr}%' if hr is not None else '—'}</td>
+          <td style="color:{'#22c55e' if ar and ar>=0 else '#ef4444'}">{f'{ar:+.2f}%' if ar is not None else '—'}</td>
+        </tr>"""
 
-    if not closed:
-        return {"total":0,"wins":0,"losses":0,"stopped":0,"win_rate":0,"avg_pnl":0}
+    veto_acc = veto.get("veto_accuracy_pct")
+    veto_color = "#22c55e" if veto_acc and veto_acc >= 55 else "#f59e0b" if veto_acc and veto_acc >= 40 else "#ef4444"
 
-    wins    = [o for o in closed if o["outcome"] == "WIN"]
-    losses  = [o for o in closed if o["outcome"] == "LOSS"]
-    stopped = [o for o in closed if o["outcome"] == "STOPPED_OUT"]
-    total   = len(closed)
-    win_rate= len(wins) / total * 100
-    avg_pnl = sum(o.get("pnl_pct",0) for o in closed) / total
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><title>HedgeFusion Feedback — {timestamp}</title>
+<style>
+  body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       background:#050d1a;color:#e2e8f0;margin:0;padding:20px}}
+  .wrap{{max-width:900px;margin:0 auto}}
+  h1{{font-size:22px;font-weight:800;color:#f8fafc;margin-bottom:4px}}
+  h2{{font-size:15px;font-weight:700;color:#e2e8f0;margin:28px 0 12px;
+      padding-bottom:8px;border-bottom:1px solid #1e293b}}
+  .meta{{font-size:12px;color:#64748b;margin-bottom:24px}}
+  table{{width:100%;border-collapse:collapse;background:#0f172a;
+         border-radius:8px;overflow:hidden;margin-bottom:16px}}
+  th{{background:#1e293b;color:#64748b;padding:9px 12px;text-align:left;
+      font-size:11px;font-weight:600}}
+  td{{padding:9px 12px;border-bottom:1px solid #1e293b;font-size:13px}}
+  .kpi{{background:#0f172a;border:1px solid #1e293b;border-radius:8px;
+        padding:18px;text-align:center}}
+  .kv{{font-size:26px;font-weight:800}}
+  .kl{{font-size:11px;color:#64748b;margin-top:3px}}
+  .disc{{background:#1e1a0a;border:1px solid #78350f;border-radius:8px;
+         padding:14px 18px;font-size:12px;color:#92400e;margin-top:24px}}
+</style>
+</head>
+<body><div class="wrap">
+  <h1>🔄 HedgeFusion Feedback Engine</h1>
+  <div class="meta">
+    {timestamp} &nbsp;·&nbsp; {r.get('eligible_runs',0)}/{r.get('total_runs',0)} runs old
+    enough to score &nbsp;·&nbsp; {r.get('forward_days',30)}-day forward window
+  </div>
 
-    # Per-ticker breakdown
-    by_ticker = {}
-    for o in closed:
-        t = o.get("ticker","")
-        if t not in by_ticker:
-            by_ticker[t] = {"total":0,"wins":0,"avg_pnl":0,"pnl_sum":0}
-        by_ticker[t]["total"]   += 1
-        by_ticker[t]["pnl_sum"] += o.get("pnl_pct",0)
-        if o["outcome"] == "WIN":
-            by_ticker[t]["wins"] += 1
-    for t in by_ticker:
-        b = by_ticker[t]
-        b["win_rate"] = round(b["wins"]/b["total"]*100, 1)
-        b["avg_pnl"]  = round(b["pnl_sum"]/b["total"], 2)
-        del b["pnl_sum"]
+  <h2>Confidence Calibration</h2>
+  <table>
+    <thead><tr><th>Confidence</th><th>n</th><th>Hit Rate</th><th>Avg Fwd Return</th></tr></thead>
+    <tbody>{cal_rows}</tbody>
+  </table>
+  <div style="font-size:12px;color:#64748b;margin-bottom:20px">
+    A well-calibrated system shows HIGH confidence winning more often than LOW confidence.
+    If the order is flat or inverted, treat the confidence field as decorative, not predictive.
+  </div>
 
-    # By confidence
-    by_conf = {}
-    for o in closed:
-        c = o.get("confidence","")
-        if c not in by_conf:
-            by_conf[c] = {"total":0,"wins":0}
-        by_conf[c]["total"] += 1
-        if o["outcome"] == "WIN":
-            by_conf[c]["wins"] += 1
-    for c in by_conf:
-        b = by_conf[c]
-        b["win_rate"] = round(b["wins"]/b["total"]*100,1)
+  <h2>Portfolio Manager Veto Effectiveness</h2>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px">
+    <div class="kpi"><div class="kv" style="color:#94a3b8">{veto.get('total_vetoes',0)}</div>
+      <div class="kl">Vetoes evaluated</div></div>
+    <div class="kpi"><div class="kv" style="color:{veto_color}">
+      {f"{veto_acc}%" if veto_acc is not None else "—"}</div>
+      <div class="kl">Veto accuracy</div></div>
+    <div class="kpi"><div class="kv" style="color:#f59e0b">{veto.get('bad_vetoes',0)}</div>
+      <div class="kl">Opportunity-cost vetoes</div></div>
+  </div>
 
-    return {
-        "total":        total,
-        "wins":         len(wins),
-        "losses":       len(losses),
-        "stopped_out":  len(stopped),
-        "win_rate":     round(win_rate, 1),
-        "avg_pnl_pct":  round(avg_pnl, 2),
-        "by_ticker":    by_ticker,
-        "by_confidence":by_conf,
-        "open_signals": len([v for v in outcomes.values()
-                             if isinstance(v,dict) and v.get("outcome")=="OPEN"]),
-        "computed_at":  datetime.now().isoformat(),
-    }
-
-
-def print_accuracy_report(acc: dict):
-    sep = "━" * 60
-    print(f"\n{sep}")
-    print(f"  FEEDBACK ENGINE — ACCURACY REPORT")
-    print(f"  {datetime.now().strftime('%d %b %Y %H:%M')}")
-    print(sep)
-    print(f"\n  Total evaluated: {acc['total']}")
-    print(f"  Wins:            {acc['wins']}")
-    print(f"  Losses:          {acc['losses']}")
-    print(f"  Stopped out:     {acc['stopped_out']}")
-    print(f"  Open signals:    {acc['open_signals']}")
-    wr = acc['win_rate']
-    print(f"  Win rate:        {wr:.1f}% {'✅ above target' if wr >= 55 else '⚠️ below 55% target'}")
-    print(f"  Avg P&L:         {acc['avg_pnl_pct']:+.2f}%")
-
-    if acc.get("by_ticker"):
-        print(f"\n  PER-TICKER ACCURACY:")
-        for ticker, stats in sorted(acc["by_ticker"].items(),
-                                    key=lambda x: x[1]["win_rate"], reverse=True):
-            print(f"    {ticker:<14} {stats['win_rate']:>5.1f}% win  "
-                  f"avg P&L {stats['avg_pnl']:>+6.2f}%  "
-                  f"({stats['wins']}/{stats['total']} calls)")
-
-    if acc.get("by_confidence"):
-        print(f"\n  BY CONFIDENCE LEVEL:")
-        for conf, stats in sorted(acc["by_confidence"].items(),
-                                  key=lambda x: x[1]["win_rate"], reverse=True):
-            print(f"    {conf:<10} {stats['win_rate']:>5.1f}% win  ({stats['wins']}/{stats['total']})")
-
-    print(f"\n{sep}\n")
-
-
-# ── Main runner ───────────────────────────────────────────────
-
-def run_feedback_engine(ticker: str | None = None) -> dict:
-    """
-    Evaluate all open signals and update outcomes + agent memory.
-    """
-    from agent_memory import update_outcome
-
-    print(f"\nFeedback engine starting...")
-    signals  = read_pipeline_signals()
-    outcomes = load_outcomes()
-
-    if ticker:
-        signals = [s for s in signals if s["ticker"].upper() == ticker.upper()]
-
-    print(f"  Signals to evaluate: {len(signals)}")
-    newly_closed = 0
-
-    for sig in signals:
-        result = evaluate_signal(sig, outcomes)
-        if result is None:
-            continue
-
-        sig_id  = sig["id"]
-        outcome = result.get("outcome")
-
-        if outcome and outcome != "OPEN":
-            outcomes[sig_id] = result
-            newly_closed += 1
-            print(f"  {sig['ticker']:<12} {sig['recommendation']:>4} → {outcome:<12} "
-                  f"P&L: {result.get('pnl_pct',0):+.2f}%")
-            # Update agent memory
-            update_outcome(sig["ticker"], outcome, result.get("pnl_pct",0))
-        elif outcome == "OPEN" and sig_id not in outcomes:
-            outcomes[sig_id] = result
-
-    save_outcomes(outcomes)
-    acc = compute_accuracy(outcomes)
-
-    # Save accuracy to feedback dir
-    acc_file = FB_DIR / "accuracy.json"
-    acc_file.write_text(json.dumps(acc, indent=2, default=str), encoding="utf-8")
-
-    print(f"\n  Newly closed: {newly_closed}")
-    print(f"  Total evaluated: {acc['total']}")
-    print(f"  Win rate: {acc['win_rate']:.1f}%")
-    print(f"  Avg P&L:  {acc['avg_pnl_pct']:+.2f}%")
-
-    return acc
+  <div class="disc">
+    ⚠️ This report scores past AI verdicts against what the stock actually did afterward —
+    it does not account for transaction costs, slippage, or whether you would have actually
+    held the full {r.get('forward_days',30)}-day window. Use as a directional calibration
+    check, not a precise backtest.
+  </div>
+</div></body></html>"""
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="HedgeFusion Feedback Engine")
-    parser.add_argument("--ticker",  help="Evaluate one ticker only")
-    parser.add_argument("--report",  action="store_true", help="Show accuracy report only")
+    parser.add_argument("--since",   type=int, default=365, help="Days of pipeline history to scan")
+    parser.add_argument("--forward", type=int, default=30,  help="Forward days to evaluate outcome")
     args = parser.parse_args()
-
-    if args.report:
-        outcomes = load_outcomes()
-        acc      = compute_accuracy(outcomes)
-        print_accuracy_report(acc)
-    else:
-        acc = run_feedback_engine(ticker=args.ticker)
-        print_accuracy_report(acc)
+    run_feedback_engine(since_days=args.since, forward_days=args.forward)

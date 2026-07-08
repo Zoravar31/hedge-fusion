@@ -64,7 +64,7 @@ HOLDINGS = [
         "target_pct":     20.0,
     },
     {
-        "ticker":         "ZOMATO",
+        "ticker":         "ETERNAL",   # formerly ZOMATO — renamed on NSE
         "qty":            50,
         "avg_buy_price":  0,
         "sector":         "Consumer Tech",
@@ -148,7 +148,6 @@ WATCHLIST = [
 SCHEDULE_MODE             = os.getenv("SCHEDULE_MODE", "daily")
 SCHEDULE_TIME             = os.getenv("SCHEDULE_TIME", "09:30")
 SCHEDULE_EXECUTE          = os.getenv("SCHEDULE_EXECUTE", "false").lower() in ("true","1","yes")
-SCHEDULE_INTERVAL_HOURS   = int(os.getenv("SCHEDULE_INTERVAL_HOURS", "24"))
 SCHEDULE_TICKERS          = [
     t.strip().upper()
     for t in os.getenv("SCHEDULE_TICKERS", ",".join(h["ticker"] for h in HOLDINGS)).split(",")
@@ -177,15 +176,6 @@ MARKET_HOLIDAYS_2026 = {
     "2026-04-14", "2026-05-01", "2026-08-15", "2026-10-02",
     "2026-10-20", "2026-10-21", "2026-11-05", "2026-12-25",
 }
-
-# ── FII/DII Dashboard settings ───────────────────────────────
-# Tickers to include in the daily FII/DII institutional scan
-# Defaults to your holdings — add watchlist stocks for broader view
-FII_DII_TICKERS = [h["ticker"] for h in HOLDINGS]  # extend as needed
-
-# Alert when FII net flow crosses these thresholds (₹ crore)
-FII_ALERT_BUY_THRESHOLD  =  1000   # FII net buy >₹1000Cr = bullish alert
-FII_ALERT_SELL_THRESHOLD = -1000   # FII net sell <-₹1000Cr = caution alert
 
 # ── Convenience helpers ───────────────────────────────────────
 HOLDING_TICKERS  = [h["ticker"] for h in HOLDINGS]

@@ -4,4 +4,6 @@ yfinance>=0.2.40
 loguru>=0.7.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-# kiteconnect>=5.0.1   # Uncomment when ready for live trading
+pandas>=2.0.0          # walk-forward backtester (Feature #14)
+openpyxl>=3.1.0         # data_exporter.py xlsx format (optional — falls back to CSV)
+# kiteconnect>=5.0.1   # Uncomment when ready for live trading + KiteTicker (Feature #13)

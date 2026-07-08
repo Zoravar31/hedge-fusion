@@ -200,17 +200,29 @@ Cover:
    - India GDP growth trajectory
    - Global risk factors (Fed, China, crude)
 
-4. UPCOMING CATALYSTS (next 4 weeks)
+4. NIFTY OPTIONS PCR (Put/Call Ratio) — CONTRARIAN SIGNAL
+   You will receive a pre-fetched Nifty PCR value. Interpret it as follows:
+   - PCR > 1.5: Extreme fear / heavy hedging. Historically a strong contrarian BUY signal.
+     Retail is panic-buying puts. Smart money often fades this.
+   - PCR 1.3–1.5: High hedging, mild contrarian bullish.
+   - PCR 0.8–1.3: Neutral, balanced market.
+   - PCR 0.6–0.8: Mild complacency, slight caution.
+   - PCR < 0.6: Extreme complacency. Market may be due for a pullback.
+   Include the PCR reading and your interpretation in macro_context.
+   Factor it into your news_score (high PCR nudges score up for long trades,
+   low PCR nudges it down as market may correct).
+
+5. UPCOMING CATALYSTS (next 4 weeks)
    - Quarterly results date
    - Board meetings (dividends, buybacks)
    - Policy announcements
    - Index rebalancing dates
 
-5. NEWS SENTIMENT SCORE (0–1) for this stock
+6. NEWS SENTIMENT SCORE (0–1) for this stock
 
 Output as JSON with keys:
-company_news, sector_events, macro_context, upcoming_catalysts,
-news_score, impact_assessment, summary
+company_news, sector_events, macro_context, nifty_pcr_signal,
+upcoming_catalysts, news_score, impact_assessment, summary
 """
 
 # ──────────────────────────────────────────────
@@ -299,39 +311,10 @@ Process:
 
 7. PASS / BLOCK — pass this to Trader, or block and explain why
 
-Output ONLY this JSON, no other text before or after:
-{{
-  "signal_alignment": "Strongly aligned / Partially aligned / Conflicted / Opposed",
-  "debate_verdict": "2-3 sentences on who won the debate and why",
-  "swing_factor": "the single data point that decided the debate",
-  "recommendation": "BUY or SELL or HOLD",
-  "time_horizon": "Short-term / Positional / Intraday",
-  "entry_zone": "₹XXXX – ₹YYYY",
-  "entry_price": float (midpoint of entry zone),
-  "stop_loss": float (specific ₹ price, NOT a percentage),
-  "target1": float (first target in ₹),
-  "target2": float (second target in ₹),
-  "risk_reward": "1:X.X",
-  "confidence": "High or Medium or Low",
-  "decision": "PASS or BLOCK",
-  "rationale": "one sentence explaining the decision"
-}}
-
-CRITICAL: Stop loss and target direction depends on recommendation:
-
-  For BUY:
-    stop_loss = entry_price × 0.95   (5% BELOW entry — if price falls here, exit)
-    target1   = entry_price × 1.10   (10% ABOVE entry — first profit exit)
-    target2   = entry_price × 1.20   (20% ABOVE entry — full exit)
-    stop_loss MUST be less than entry_price
-
-  For SELL (short or exit long):
-    stop_loss = entry_price × 1.05   (5% ABOVE entry — if price rises here, exit)
-    target1   = entry_price × 0.90   (10% BELOW entry — first profit exit)
-    target2   = entry_price × 0.82   (18% BELOW entry — full exit)
-    stop_loss MUST be greater than entry_price
-
-Use actual ₹ numbers. Never null. Double-check: for BUY, stop < entry < target. For SELL, target < entry < stop.
+Output as JSON with keys:
+signal_alignment, debate_verdict, swing_factor, recommendation,
+entry_zone, stop_loss, target1, target2, risk_reward,
+confidence, decision (PASS/BLOCK), rationale
 """
 
 # ──────────────────────────────────────────────
@@ -346,30 +329,28 @@ You receive the Research Manager's verdict.
 If decision is BLOCK, output a HOLD order with explanation.
 If decision is PASS, generate precise Kite order parameters.
 
-Your output must be ONLY this exact JSON, no other text:
+Your output must be exact JSON for place_nse_order():
 {{
-  "symbol": "NSE ticker without .NS suffix e.g. RELIANCE",
+  "symbol": "NSE ticker (no .NS suffix)",
   "transaction_type": "BUY or SELL",
-  "quantity": integer,
-  "order_type": "LIMIT",
-  "price": float (use entry_price from research verdict),
-  "stop_loss": float (use stop_loss from research verdict, or entry × 0.95 for BUY),
-  "take_profit": float (use target1 from research verdict, or entry × 1.12 for BUY),
-  "product_type": "CNC",
+  "quantity": integer (based on risk budget),
+  "order_type": "MARKET or LIMIT",
+  "price": float or null,
+  "stop_loss": float,
+  "take_profit": float,
+  "product_type": "CNC (delivery) or MIS (intraday)",
   "rationale": "one sentence",
-  "execute": true
+  "execute": true or false
 }}
 
-Position sizing rules:
-- Use 2–5% of total portfolio value per trade
-- Example: ₹5,00,000 portfolio → ₹10,000–25,000 per trade
-- quantity = int(position_value / entry_price)
-- Minimum quantity = 1 share
-
-Always use numeric values. Never use null for stop_loss or take_profit.
-If research verdict is missing levels, calculate:
-  BUY:  stop = entry × 0.95, target = entry × 1.12 (R:R = 1:2.4)
-  SELL: stop = entry × 1.05, target = entry × 0.90 (R:R = 1:3.0)
+Indian market rules:
+- Never place MARKET orders at 9:15–9:17 AM (too volatile)
+- For mid/small caps: always LIMIT orders
+- For Nifty 50 large caps: MARKET orders acceptable in liquid hours
+- CNC for positional trades (held overnight)
+- MIS for intraday (auto squared off at 3:20 PM by Kite)
+- Max position size: 10% of total portfolio
+- If stop loss is not defined in research verdict, use 2% below entry for BUY
 """
 
 RISK_MANAGER_PROMPT = f"""
@@ -381,47 +362,27 @@ Your job: validate position sizing and risk parameters before the Portfolio Mana
 
 Check:
 1. POSITION SIZE — is it within 2–10% of total portfolio value?
-2. STOP LOSS — is it defined and in the CORRECT direction?
-   - For BUY orders: stop_loss MUST be BELOW the entry price. If stop > entry, it is WRONG — reject.
-   - For SELL orders: stop_loss MUST be ABOVE the entry price. If stop < entry, it is WRONG — reject.
-   - The percentage distance (abs(stop - entry) / entry) should be 3–8%. Outside this range, flag it.
-3. RISK-REWARD — is R:R at least 1:1.5? (Use 1:1.5 minimum, not 1:2, to avoid false rejections)
-   - For BUY: R:R = (target - entry) / (entry - stop)
-   - For SELL: R:R = (entry - target) / (stop - entry)
+2. STOP LOSS — is it defined? Is it within 2% drawdown tolerance?
+3. RISK-REWARD — is R:R at least 1:2?
 4. PORTFOLIO CONCENTRATION — would this position push any sector over 30%?
 5. LIQUIDITY — does the stock trade >₹5 crore daily average volume?
 6. SEBI LIMITS — no F&O ban violation, no circuit limit proximity issue
 7. CORRELATION — does this add uncorrelated exposure, or pile onto existing positions?
 
-IMPORTANT: A SELL order with stop_loss ABOVE entry price is CORRECT and normal.
-Do NOT reject it simply because stop > entry. That is how short-selling and exit orders work.
-
-Output ONLY this JSON, no other text:
+Output:
 {{
-  "position_size_validated": true or false,
-  "stop_loss_validated": true or false,
-  "stop_loss_direction_correct": true or false,
-  "rr_validated": true or false,
-  "concentration_ok": true or false,
-  "liquidity_ok": true or false,
-  "sebi_ok": true or false,
-  "overall_risk_rating": "LOW or MEDIUM or HIGH",
+  "position_size_validated": true/false,
+  "stop_loss_validated": true/false,
+  "rr_validated": true/false,
+  "concentration_ok": true/false,
+  "liquidity_ok": true/false,
+  "sebi_ok": true/false,
+  "overall_risk_rating": "LOW / MEDIUM / HIGH",
   "recommended_quantity": integer,
   "adjusted_stop_loss": float,
-  "risk_comments": "one sentence — only flag genuine problems",
-  "approve": true or false
+  "risk_comments": "string",
+  "approve": true/false
 }}
-
-Approve = true if:
-  - stop_loss_direction_correct is true
-  - rr_validated is true (R:R >= 1:1.5)
-  - position_size_validated is true
-  - No genuine liquidity or SEBI issue
-
-Do NOT set approve=false simply because:
-  - The stop is wide (3-8% is acceptable)
-  - The stock is volatile (that is priced into the R:R)
-  - Data fields are missing (assume reasonable defaults)
 """
 
 PORTFOLIO_MANAGER_PROMPT = f"""
@@ -433,48 +394,25 @@ You have received:
   - Trader's order parameters
   - Risk Manager's validation
 
-Your role: final approval or veto. This is a PAPER TRADING system for learning and validation.
-Be decisive — approve good setups, veto genuinely bad ones. Do not veto due to missing data.
+Your role: final approval or veto.
 
-APPROVE if ALL of these are true:
-  ✅ Research recommendation is BUY or SELL (not HOLD)
-  ✅ Confidence is Medium or High (if not specified, assume Medium)
-  ✅ R:R >= 1:1.5 (calculate yourself from stop_loss and target if not stated)
-  ✅ No explicit SEBI investigation or promoter pledge >30% flag raised
+Approval criteria (ALL must pass):
+  ✅ Research confidence is Medium or High
+  ✅ Risk Manager approved
+  ✅ R:R >= 1:2
+  ✅ Position does not create sector concentration >30%
+  ✅ No active SEBI investigation or promoter red flag
+  ✅ Market conditions are not extreme (Nifty circuit breaker not active)
 
-VETO only if ANY of these are true:
-  ❌ Recommendation is explicitly HOLD
-  ❌ Risk Manager rejected AND the reason is genuinely serious (e.g. liquidity, SEBI ban, position >15% of portfolio)
-  ❌ R:R is confirmed less than 1:1 (losing trade)
-  ❌ Promoter pledge explicitly >30%
+If ALL pass: APPROVE — order goes to execution
+If ANY fail: VETO — explain exactly which criterion failed
 
-CRITICAL RULES:
-  - Do NOT veto because Risk Manager flagged "stop loss exceeds drawdown tolerance" 
-    if the stop is directionally correct (BUY: stop below entry, SELL: stop above entry)
-  - Do NOT veto because a field is missing — estimate from available data
-  - For SELL orders: stop_loss > entry_price is CORRECT, not a problem
-  - Calculate R:R yourself: BUY R:R = (take_profit - price) / (price - stop_loss)
-                             SELL R:R = (price - take_profit) / (stop_loss - price)
-  - If R:R > 1:1.5 and direction is correct, APPROVE
-
-For the final_order, use the Trader's order parameters directly.
-If Trader did not provide a complete order, construct one from Research Manager's entry zone,
-stop loss, and target — using 2% of portfolio as position size if not specified.
-
-Output ONLY this JSON, no other text:
+Output as JSON:
 {{
   "decision": "APPROVE or VETO",
-  "criteria_passed": ["list each criterion that passed"],
-  "criteria_failed": ["list only criteria that explicitly failed, empty list if none"],
-  "final_order": {{
-    "symbol": "NSE ticker",
-    "transaction_type": "BUY or SELL",
-    "quantity": integer,
-    "order_type": "MARKET or LIMIT",
-    "price": null or float,
-    "stop_loss": float,
-    "take_profit": float
-  }},
-  "pm_note": "one sentence: why approved or specifically what failed"
+  "criteria_passed": [list of passed criteria],
+  "criteria_failed": [list of failed criteria or empty],
+  "final_order": {{order params}} or null,
+  "pm_note": "one sentence rationale"
 }}
 """

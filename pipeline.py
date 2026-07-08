@@ -54,6 +54,7 @@ from tools.india_data import (
     DATA_TOOL_MAP,
     get_nse_quote,
     get_macro_india_context,
+    get_nifty_pcr,
 )
 from tools.fii_dii import (
     FII_DII_TOOL_DEFINITIONS,
@@ -68,6 +69,7 @@ from tools.kite_execution import (
     place_nse_order,
     get_paper_portfolio,
 )
+from position_sizer import POSITION_SIZER_TOOL_DEFINITIONS, POSITION_SIZER_TOOL_MAP
 
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -129,13 +131,27 @@ def run_sentiment_analyst(ticker: str) -> dict:
 
 def run_news_analyst(ticker: str) -> dict:
     macro = get_macro_india_context()
+    # Pre-fetch Nifty PCR — key contrarian signal for the News agent
+    try:
+        pcr_data = get_nifty_pcr()
+        pcr_obj  = json.loads(pcr_data)
+        pcr_line = (
+            f"NIFTY PCR: {pcr_obj.get('pcr', 'N/A')} — {pcr_obj.get('signal', '')}\n"
+            f"  Interpretation: {pcr_obj.get('interpretation', '')}"
+        )
+    except Exception:
+        pcr_line = "NIFTY PCR: unavailable"
+
     raw = run_agent(
         agent_name=f"News [{ticker}]",
         system_prompt=NEWS_PROMPT,
         user_message=(
             f"Analyse news and macro impact on {ticker} (NSE).\n"
             f"Current India macro context:\n{macro[:1500]}\n\n"
-            f"Fetch company-specific news for {ticker}."
+            f"MARKET SENTIMENT — NIFTY OPTIONS PCR (live):\n{pcr_line}\n\n"
+            f"Fetch company-specific news for {ticker}. "
+            f"Factor the PCR into your macro_context and news_score — "
+            f"a PCR > 1.3 is a contrarian buy signal; PCR < 0.8 suggests complacency."
         ),
         tools=DATA_TOOL_DEFINITIONS,
         tool_map=DATA_ONLY_MAP,
@@ -168,11 +184,14 @@ def run_bear_researcher(ticker: str, analyst_reports: dict) -> dict:
 
 
 def run_research_manager(ticker: str, analyst_reports: dict, bull: dict, bear: dict) -> dict:
+    from agent_memory import summarize_memory
+    prior_memory = summarize_memory(ticker, last_n=3)
     context = (
         f"TICKER: {ticker}\n\n"
         f"ANALYST REPORTS:\n{_format_analyst_context(ticker, analyst_reports)}\n\n"
         f"BULL RESEARCHER:\n{json.dumps(bull, default=str)[:1500]}\n\n"
         f"BEAR RESEARCHER:\n{json.dumps(bear, default=str)[:1500]}"
+        + (f"\n\n{prior_memory}" if prior_memory else "")
     )
     raw = run_agent(
         agent_name=f"Research Manager [{ticker}]",
@@ -186,14 +205,16 @@ def run_trader(ticker: str, research_verdict: dict, portfolio_size_inr: float) -
     context = (
         f"TICKER: {ticker}\n"
         f"PORTFOLIO SIZE: ₹{portfolio_size_inr:,.0f}\n\n"
-        f"RESEARCH VERDICT:\n{json.dumps(research_verdict, default=str)[:2000]}"
+        f"RESEARCH VERDICT:\n{json.dumps(research_verdict, default=str)[:2000]}\n\n"
+        f"Use calculate_position_size to determine the correct share quantity "
+        f"based on your entry price and stop loss — do not guess a round number."
     )
     raw = run_agent(
         agent_name=f"Trader [{ticker}]",
         system_prompt=TRADER_PROMPT,
         user_message=context,
-        tools=DATA_TOOL_DEFINITIONS,
-        tool_map=DATA_ONLY_MAP,
+        tools=DATA_TOOL_DEFINITIONS + POSITION_SIZER_TOOL_DEFINITIONS,
+        tool_map={**DATA_ONLY_MAP, **POSITION_SIZER_TOOL_MAP},
     )
     return parse_json_response(raw) or {"execute": False, "rationale": "parse error"}
 
@@ -431,5 +452,12 @@ def run_pipeline(
     out_path = OUTPUT_DIR / f"{ticker}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
     out_path.write_text(json.dumps(state, default=str, indent=2), encoding="utf-8")
     logger.info("  Saved: {}", out_path.name)
+
+    # Record this verdict into per-ticker agent memory for future runs
+    try:
+        from agent_memory import record_verdict
+        record_verdict(ticker, state)
+    except Exception as e:
+        logger.warning("agent_memory recording failed: {}", e)
 
     return state

@@ -1,400 +1,342 @@
 """
 HedgeFusion Data Exporter
-===========================
-Reads all pipeline JSON outputs, paper trade CSV, and live prices —
-then writes a single dashboard_data.json that the portfolio dashboard
-reads on every page load.
+============================
+Export any HedgeFusion dataset to CSV, Excel (.xlsx), or JSON for
+external use — tax filing, personal spreadsheets, sharing with a CA,
+or importing into other tools.
 
-Run this after every pipeline run:
-    python data_exporter.py
+Supported exports:
+  trades      → paper_trades.csv reformatted (with computed P&L)
+  holdings    → current config.py holdings with live prices
+  portfolio   → latest portfolio_runner.py results
+  watchlist   → current watchlist with latest scan data
+  journal     → closed trade P&L detail from trade_journal
+  memory      → agent_memory.json flattened to a table
 
-Or it auto-runs at the end of portfolio_runner.py when called with --export.
+Formats:
+  csv   — always available (stdlib csv module)
+  xlsx  — requires openpyxl (pip install openpyxl); falls back to
+          csv with a warning if not installed
+  json  — raw structured export
 
-Output: data/dashboard_data.json
+Usage:
+    python data_exporter.py --what trades --format xlsx
+    python data_exporter.py --what holdings --format csv
+    python data_exporter.py --what journal --format xlsx --since 180
+    python data_exporter.py --what all --format csv          # export everything
 """
 
 import csv
 import json
 import os
-import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
-
 from loguru import logger
 
-ROOT       = Path(__file__).parent
-DATA_DIR   = ROOT / "data"
-OUTPUT_DIR = ROOT / "outputs"
-LOG_DIR    = ROOT / "logs"
-PAPER_LOG  = LOG_DIR / "paper_trades.csv"
-DASH_FILE  = DATA_DIR / "dashboard_data.json"
-DATA_DIR.mkdir(exist_ok=True)
+load_dotenv(Path(__file__).parent / ".env")
+
+OUTPUT_DIR = Path(__file__).parent / "outputs" / "exports"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── Live price fetcher ────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Format writers
+# ──────────────────────────────────────────────
 
-def fetch_live_prices(tickers: list[str]) -> dict[str, dict]:
-    """Fetch current prices for all holdings via yfinance."""
-    prices = {}
+def _write_csv(rows: list, path: Path) -> Path:
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return path
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    return path
+
+
+def _write_xlsx(rows: list, path: Path, sheet_name: str = "Sheet1") -> Path:
+    """Write rows to .xlsx using openpyxl. Falls back to CSV if not installed."""
     try:
-        import yfinance as yf
-        syms = [t.upper() + ".NS" for t in tickers]
-        data = yf.download(
-            syms, period="2d", interval="1d",
-            auto_adjust=True, progress=False, show_errors=False,
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        logger.warning("openpyxl not installed — run: pip install openpyxl. Falling back to CSV.")
+        csv_path = path.with_suffix(".csv")
+        return _write_csv(rows, csv_path)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+
+    if not rows:
+        wb.save(path)
+        return path
+
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for row in rows:
+        ws.append([row.get(h, "") for h in headers])
+
+    # Auto-size columns (approximate)
+    for i, header in enumerate(headers, 1):
+        max_len = max(
+            [len(str(header))] + [len(str(row.get(header, ""))) for row in rows]
         )
-        close = data.get("Close", data)
-        for ticker in tickers:
-            sym = ticker.upper() + ".NS"
-            try:
-                hist = close[sym].dropna()
-                if len(hist) >= 2:
-                    ltp  = float(hist.iloc[-1])
-                    prev = float(hist.iloc[-2])
-                    prices[ticker] = {
-                        "ltp":      round(ltp, 2),
-                        "prev":     round(prev, 2),
-                        "day_chg":  round((ltp - prev) / prev * 100, 2),
-                        "day_abs":  round(ltp - prev, 2),
-                    }
-                elif len(hist) == 1:
-                    prices[ticker] = {"ltp": float(hist.iloc[-1]), "prev": 0, "day_chg": 0, "day_abs": 0}
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("Price fetch failed: {}", e)
-    return prices
+        ws.column_dimensions[chr(64 + i) if i <= 26 else "A"].width = min(max_len + 2, 40)
+
+    wb.save(path)
+    return path
 
 
-def fetch_nifty_data(period: str = "1y") -> dict:
-    """Fetch Nifty 50 data for benchmark comparison."""
-    try:
-        import yfinance as yf
-        nifty = yf.Ticker("^NSEI")
-        hist  = nifty.history(period=period, interval="1d")
-        if hist is None or hist.empty:
-            return {}
-        closes = hist["Close"].dropna()
-        dates  = [d.strftime("%d %b") for d in closes.index]
-        vals   = [round(float(v), 2) for v in closes]
+def _write_json(data, path: Path) -> Path:
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    return path
 
-        ret_1w  = (vals[-1] - vals[-5])  / vals[-5]  * 100 if len(vals) >= 5   else 0
-        ret_1m  = (vals[-1] - vals[-22]) / vals[-22] * 100 if len(vals) >= 22  else 0
-        ret_3m  = (vals[-1] - vals[-65]) / vals[-65] * 100 if len(vals) >= 65  else 0
-        ret_1y  = (vals[-1] - vals[0])   / vals[0]   * 100
 
-        return {
-            "current":  vals[-1],
-            "dates":    dates[-252:],
-            "values":   vals[-252:],
-            "ret_1w":   round(ret_1w, 2),
-            "ret_1m":   round(ret_1m, 2),
-            "ret_3m":   round(ret_3m, 2),
-            "ret_1y":   round(ret_1y, 2),
-            "day_chg":  round((vals[-1] - vals[-2]) / vals[-2] * 100, 2) if len(vals) >= 2 else 0,
+def _export(rows: list, name: str, fmt: str) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    fmt = fmt.lower()
+    if fmt == "csv":
+        path = OUTPUT_DIR / f"{name}_{ts}.csv"
+        return _write_csv(rows, path)
+    elif fmt == "xlsx":
+        path = OUTPUT_DIR / f"{name}_{ts}.xlsx"
+        return _write_xlsx(rows, path, sheet_name=name[:31])
+    elif fmt == "json":
+        path = OUTPUT_DIR / f"{name}_{ts}.json"
+        return _write_json(rows, path)
+    else:
+        raise ValueError(f"Unknown format: {fmt}. Use csv, xlsx, or json.")
+
+
+# ──────────────────────────────────────────────
+# Dataset builders
+# ──────────────────────────────────────────────
+
+def export_trades(fmt: str = "csv", since_days: int = 365) -> Path:
+    """Export raw paper trade log."""
+    from trade_journal import load_paper_trades
+    trades = load_paper_trades(since_days=since_days)
+    rows = [
+        {
+            "date":             t["ts"].strftime("%Y-%m-%d %H:%M"),
+            "order_id":         t.get("order_id", ""),
+            "symbol":           t.get("symbol", ""),
+            "type":             t.get("transaction_type", ""),
+            "quantity":         t.get("quantity", 0),
+            "fill_price":       t.get("fill_price", 0),
+            "value_inr":        t.get("value_inr", 0),
+            "stop_loss":        t.get("stop_loss", ""),
+            "take_profit":      t.get("take_profit", ""),
+            "status":           t.get("status", ""),
         }
-    except Exception as e:
-        logger.warning("Nifty fetch failed: {}", e)
-        return {}
+        for t in trades
+    ]
+    return _export(rows, "trades", fmt)
 
 
-# ── Pipeline output reader ────────────────────────────────────
+def export_journal(fmt: str = "csv", since_days: int = 365) -> Path:
+    """Export closed-trade P&L detail (matched buy/sell pairs)."""
+    from trade_journal import load_paper_trades, compute_stats
+    trades = load_paper_trades(since_days=since_days)
+    stats  = compute_stats(trades)
+    rows = [
+        {
+            "symbol":      c["symbol"],
+            "entry_date":  c["entry_date"],
+            "exit_date":   c["exit_date"],
+            "entry_price": c["entry_price"],
+            "exit_price":  c["exit_price"],
+            "quantity":    c["quantity"],
+            "pnl_inr":     c["pnl_inr"],
+            "pnl_pct":     c["pnl_pct"],
+            "won":         "YES" if c["won"] else "NO",
+        }
+        for c in stats.get("closed_trade_detail", [])
+    ]
+    return _export(rows, "journal", fmt)
 
-def read_pipeline_outputs(days: int = 30) -> list[dict]:
-    """Read all pipeline JSON outputs from the last N days."""
-    cutoff  = datetime.now() - timedelta(days=days)
-    outputs = []
-    for p in OUTPUT_DIR.glob("*.json"):
+
+def export_holdings(fmt: str = "csv") -> Path:
+    """Export current config.py holdings with live prices and P&L."""
+    from config import HOLDINGS
+    from tools.india_data import get_nse_quote
+
+    rows = []
+    for h in HOLDINGS:
+        ticker = h["ticker"]
+        current_price = 0.0
         try:
-            mtime = datetime.fromtimestamp(p.stat().st_mtime)
-            if mtime < cutoff:
-                continue
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "ticker" in data:
-                data["_file"]  = p.name
-                data["_mtime"] = mtime.isoformat()
-                outputs.append(data)
+            q = json.loads(get_nse_quote(ticker))
+            current_price = (
+                q.get("info", {}).get("currentPrice")
+                or q.get("latest_close")
+                or 0.0
+            )
         except Exception:
             pass
-    # Sort: newest first, deduplicate by ticker (keep most recent per ticker)
-    outputs.sort(key=lambda x: x["_mtime"], reverse=True)
-    seen    = set()
-    deduped = []
-    for o in outputs:
-        t = o.get("ticker","")
-        if t not in seen:
-            seen.add(t)
-            deduped.append(o)
-    return deduped
 
-
-def extract_signals(outputs: list[dict]) -> list[dict]:
-    """Extract clean signal data from pipeline outputs for the dashboard."""
-    signals = []
-    for o in outputs:
-        rv  = o.get("research_verdict") or {}
-        pm  = o.get("pm_decision") or {}
-        ex  = o.get("execution_result") or {}
-        bull= o.get("bull") or {}
-        bear= o.get("bear") or {}
-        signals.append({
-            "ticker":      o.get("ticker",""),
-            "run_time":    o.get("_mtime",""),
-            "recommendation": rv.get("recommendation",""),
-            "confidence":  rv.get("confidence",""),
-            "entry_zone":  rv.get("entry_zone",""),
-            "stop_loss":   rv.get("stop_loss"),
-            "target1":     rv.get("target1"),
-            "target2":     rv.get("target2"),
-            "risk_reward": rv.get("risk_reward",""),
-            "debate_verdict": rv.get("debate_verdict","")[:120] if rv.get("debate_verdict") else "",
-            "pm_decision": pm.get("decision",""),
-            "pm_note":     pm.get("pm_note","")[:100] if pm.get("pm_note") else "",
-            "order_id":    ex.get("order_id",""),
-            "fill_price":  ex.get("fill_price"),
-            "bull_conviction": bull.get("conviction"),
-            "bear_conviction": bear.get("conviction"),
-            "elapsed_s":   o.get("elapsed_seconds"),
-        })
-    return signals
-
-
-# ── Paper trade reader ────────────────────────────────────────
-
-def read_paper_trades() -> list[dict]:
-    """Read all paper trades from CSV log."""
-    if not PAPER_LOG.exists():
-        return []
-    trades = []
-    with open(PAPER_LOG, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            try:
-                row["fill_price"]  = float(row.get("fill_price") or 0)
-                row["quantity"]    = int(row.get("quantity") or 0)
-                row["value_inr"]   = float(row.get("value_inr") or 0)
-                row["stop_loss"]   = float(row.get("stop_loss") or 0) if row.get("stop_loss") else None
-                row["take_profit"] = float(row.get("take_profit") or 0) if row.get("take_profit") else None
-                trades.append(row)
-            except Exception:
-                pass
-    return trades
-
-
-# ── Portfolio builder ─────────────────────────────────────────
-
-def build_portfolio_data(
-    holdings: list[dict],
-    prices:   dict[str, dict],
-    trades:   list[dict],
-) -> dict:
-    """
-    Build complete portfolio data combining config holdings,
-    live prices, and paper trade history.
-    """
-    rows = []
-    for h in holdings:
-        ticker = h["ticker"]
-        price  = prices.get(ticker, {})
-        ltp    = price.get("ltp", 0)
-        prev   = price.get("prev", 0)
-
-        # Use live LTP if available, else fall back to avg_buy_price
-        if ltp == 0:
-            ltp = h.get("avg_buy_price", 0) or 0
-
-        avg    = h.get("avg_buy_price") or 0
-        qty    = h.get("qty") or 0
-        inv    = qty * avg
-        cur    = qty * ltp
-        pnl    = cur - inv if avg > 0 else 0
-        pnlp   = pnl / inv * 100 if inv > 0 else 0
-        day_chg= price.get("day_chg", 0)
-        day_abs= price.get("day_abs", 0)
-        day_pnl= qty * day_abs
+        invested = h.get("qty", 0) * h.get("avg_buy_price", 0)
+        current_value = h.get("qty", 0) * current_price
+        pnl = current_value - invested if invested else 0
 
         rows.append({
-            "ticker":    ticker,
-            "sector":    h.get("sector",""),
-            "qty":       qty,
-            "avg":       avg,
-            "ltp":       ltp,
-            "invested":  round(inv, 2),
-            "current":   round(cur, 2),
-            "pnl":       round(pnl, 2),
-            "pnl_pct":   round(pnlp, 2),
-            "day_chg":   day_chg,
-            "day_pnl":   round(day_pnl, 2),
-            "data_live": ltp > 0 and prev > 0,
+            "ticker":         ticker,
+            "sector":         h.get("sector", ""),
+            "qty":            h.get("qty", 0),
+            "avg_buy_price":  h.get("avg_buy_price", 0),
+            "current_price":  round(float(current_price), 2),
+            "invested_inr":   round(invested, 2),
+            "current_value_inr": round(current_value, 2),
+            "pnl_inr":        round(pnl, 2),
+            "pnl_pct":        round(pnl / invested * 100, 2) if invested else 0,
+            "stop_loss_pct":  h.get("stop_loss_pct", ""),
+            "target_pct":     h.get("target_pct", ""),
         })
-
-    total_inv  = sum(r["invested"] for r in rows)
-    total_cur  = sum(r["current"]  for r in rows)
-    total_pnl  = total_cur - total_inv
-    total_pct  = total_pnl / total_inv * 100 if total_inv > 0 else 0
-    day_pnl    = sum(r["day_pnl"]  for r in rows)
-    day_pct    = day_pnl / total_cur * 100 if total_cur > 0 else 0
-
-    # Sector breakdown
-    sectors = {}
-    for r in rows:
-        s = r["sector"] or "Other"
-        sectors[s] = sectors.get(s, 0) + r["current"]
-
-    return {
-        "rows":       rows,
-        "total_inv":  round(total_inv, 2),
-        "total_cur":  round(total_cur, 2),
-        "total_pnl":  round(total_pnl, 2),
-        "total_pct":  round(total_pct, 2),
-        "day_pnl":    round(day_pnl, 2),
-        "day_pct":    round(day_pct, 2),
-        "sectors":    {k: round(v, 2) for k,v in
-                       sorted(sectors.items(), key=lambda x: x[1], reverse=True)},
-        "paper_trades": len(trades),
-        "open_positions": len([r for r in rows if r["qty"] > 0]),
-    }
+    return _export(rows, "holdings", fmt)
 
 
-# ── Equity curve builder ──────────────────────────────────────
-
-def build_equity_curve(
-    holdings: list[dict],
-    prices:   dict[str, dict],
-    period:   str = "1y",
-) -> dict:
-    """Build portfolio equity curve by summing all holdings historical prices."""
-    try:
-        import yfinance as yf
-        tickers = [h["ticker"].upper() + ".NS" for h in holdings]
-        n_days  = {"1W":7,"1M":22,"3M":65,"6M":130,"1Y":252}.get(period, 252)
-
-        data  = yf.download(tickers, period="1y", interval="1d",
-                            auto_adjust=True, progress=False, show_errors=False)
-        close = data.get("Close", data)
-
-        # Build daily portfolio value
-        dates  = []
-        values = []
-        idx    = close.index[-n_days:]
-
-        for date in idx:
-            day_val = 0
-            for h in holdings:
-                sym = h["ticker"].upper() + ".NS"
-                try:
-                    price = float(close.loc[date, sym])
-                    day_val += h.get("qty", 0) * price
-                except Exception:
-                    # Use avg_buy_price as fallback
-                    day_val += h.get("qty",0) * (h.get("avg_buy_price") or 0)
-            dates.append(date.strftime("%d %b"))
-            values.append(round(day_val, 2))
-
-        return {
-            "dates":   dates,
-            "values":  values,
-            "start":   values[0] if values else 0,
-            "end":     values[-1] if values else 0,
-            "return":  round((values[-1]-values[0])/values[0]*100, 2) if values and values[0] else 0,
+def export_watchlist(fmt: str = "csv") -> Path:
+    """Export current watchlist."""
+    from watchlist import load_watchlist
+    wl = load_watchlist()
+    rows = [
+        {
+            "ticker":       w["ticker"],
+            "entry_target": w.get("entry_target", 0),
+            "reason":       w.get("reason", ""),
+            "added":        w.get("added", ""),
         }
-    except Exception as e:
-        logger.warning("Equity curve build failed: {}", e)
-        return {"dates": [], "values": [], "start": 0, "end": 0, "return": 0}
+        for w in wl
+    ]
+    return _export(rows, "watchlist", fmt)
 
 
-# ── Main exporter ─────────────────────────────────────────────
+def export_latest_portfolio(fmt: str = "csv") -> Path:
+    """Export the most recent portfolio_runner.py JSON output as a flat table."""
+    outputs_dir = Path(__file__).parent / "outputs"
+    candidates = sorted(outputs_dir.glob("portfolio_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError("No portfolio_*.json found. Run: python hf.py portfolio")
 
-def export_dashboard_data(silent: bool = False) -> dict:
+    data = json.loads(candidates[0].read_text(encoding="utf-8"))
+    rows = []
+    for r in data:
+        rv = r.get("research_verdict", {})
+        pm = r.get("pm_decision", {})
+        ex = r.get("execution_result") or {}
+        rows.append({
+            "ticker":         r.get("ticker", ""),
+            "sector":         r.get("holding_sector", ""),
+            "recommendation": rv.get("recommendation", ""),
+            "confidence":     rv.get("confidence", ""),
+            "pm_decision":    pm.get("decision", ""),
+            "entry_zone":     rv.get("entry_zone", ""),
+            "stop_loss":      rv.get("stop_loss", ""),
+            "target1":        rv.get("target1", ""),
+            "risk_reward":    rv.get("risk_reward", ""),
+            "order_status":   ex.get("order_id") or ex.get("status", ""),
+        })
+    return _export(rows, "portfolio", fmt)
+
+
+def export_memory(fmt: str = "csv") -> Path:
+    """Export agent_memory.json flattened to one row per verdict."""
+    from agent_memory import _load_all
+    all_mem = _load_all()
+    rows = []
+    for ticker, mem in all_mem.items():
+        for h in mem.get("history", []):
+            rows.append({
+                "ticker":         ticker,
+                "date":           h.get("date", ""),
+                "recommendation": h.get("recommendation", ""),
+                "pm_decision":    h.get("pm_decision", ""),
+                "confidence":     h.get("confidence", ""),
+                "entry_zone":     h.get("entry_zone", ""),
+                "stop_loss":      h.get("stop_loss", ""),
+                "target1":        h.get("target1", ""),
+                "order_status":   h.get("order_status", ""),
+            })
+    return _export(rows, "memory", fmt)
+
+
+# ──────────────────────────────────────────────
+# Main dispatcher
+# ──────────────────────────────────────────────
+
+EXPORTERS = {
+    "trades":    export_trades,
+    "journal":   export_journal,
+    "holdings":  export_holdings,
+    "watchlist": export_watchlist,
+    "portfolio": export_latest_portfolio,
+    "memory":    export_memory,
+}
+
+
+def run_export(what: str, fmt: str = "csv", since_days: int = 365) -> list:
     """
-    Build and write the complete dashboard data JSON.
-    Called after every pipeline run.
+    Export one dataset, or "all" for every dataset.
+    Returns list of Path objects written.
     """
-    from config import HOLDINGS
+    if what == "all":
+        targets = list(EXPORTERS.keys())
+    else:
+        targets = [what]
 
-    if not silent:
-        print("Building dashboard data...")
-
-    tickers = [h["ticker"] for h in HOLDINGS]
-
-    # Fetch live data
-    if not silent: print("  Fetching live prices...")
-    prices = fetch_live_prices(tickers)
-    if not silent: print(f"  Got prices for {len(prices)}/{len(tickers)} stocks")
-
-    if not silent: print("  Fetching Nifty 50 data...")
-    nifty = fetch_nifty_data()
-
-    # Read pipeline outputs
-    if not silent: print("  Reading pipeline outputs...")
-    outputs = read_pipeline_outputs(days=30)
-    signals = extract_signals(outputs)
-    if not silent: print(f"  Found {len(signals)} recent pipeline runs")
-
-    # Read paper trades
-    trades = read_paper_trades()
-    if not silent: print(f"  Paper trades: {len(trades)}")
-
-    # Build portfolio
-    portfolio = build_portfolio_data(HOLDINGS, prices, trades)
-
-    # Read agent memory
-    memory = {}
-    mem_dir = DATA_DIR / "memory"
-    if mem_dir.exists():
-        for f in mem_dir.glob("*.json"):
-            try:
-                memory[f.stem] = json.loads(f.read_text())
-            except Exception:
-                pass
-
-    # Read feedback
-    feedback = {}
-    fb_file = DATA_DIR / "feedback" / "outcomes.json"
-    if fb_file.exists():
+    written = []
+    for name in targets:
+        fn = EXPORTERS.get(name)
+        if not fn:
+            print(f"  ⚠ Unknown export target: {name}")
+            continue
         try:
-            feedback = json.loads(fb_file.read_text())
-        except Exception:
-            pass
+            if name in ("trades", "journal"):
+                path = fn(fmt, since_days)
+            else:
+                path = fn(fmt)
+            written.append(path)
+            size_kb = path.stat().st_size / 1024 if path.exists() else 0
+            print(f"  ✅ {name:<12} → {path.name}  ({size_kb:.1f} KB)")
+        except Exception as e:
+            print(f"  ❌ {name:<12} failed: {e}")
+            logger.error("export {} failed: {}", name, e)
 
-    dashboard = {
-        "generated_at":  datetime.now().isoformat(),
-        "market_open":   _is_market_open(),
-        "portfolio":     portfolio,
-        "signals":       signals,
-        "paper_trades":  trades[-50:],  # last 50 trades
-        "nifty":         nifty,
-        "agent_memory":  memory,
-        "feedback":      feedback,
-        "meta": {
-            "total_pipeline_runs": len(outputs),
-            "last_run":           outputs[0].get("_mtime","") if outputs else "",
-            "paper_mode":         os.getenv("KITE_PAPER_TRADE","true").lower() in ("true","1"),
-        }
-    }
-
-    DASH_FILE.write_text(
-        json.dumps(dashboard, indent=2, default=str),
-        encoding="utf-8"
-    )
-    if not silent:
-        print(f"\n✅ Dashboard data written: {DASH_FILE}")
-        print(f"   Portfolio value: ₹{portfolio['total_cur']:,.0f}")
-        print(f"   Total P&L:       ₹{portfolio['total_pnl']:+,.0f} ({portfolio['total_pct']:+.2f}%)")
-        print(f"   Signals:         {len(signals)}")
-
-    return dashboard
+    return written
 
 
-def _is_market_open() -> bool:
-    now = datetime.now()
-    if now.weekday() >= 5:
-        return False
-    h, m = now.hour, now.minute
-    return (h == 9 and m >= 15) or (10 <= h <= 14) or (h == 15 and m <= 30)
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="HedgeFusion Data Exporter")
+    parser.add_argument("--what",   default="all",
+                        choices=list(EXPORTERS.keys()) + ["all"],
+                        help="Dataset to export (default: all)")
+    parser.add_argument("--format", default="csv", choices=["csv", "xlsx", "json"])
+    parser.add_argument("--since",  type=int, default=365, help="Days of history for trades/journal")
+    args = parser.parse_args()
+
+    print(f"\n{'━'*55}")
+    print(f"  HEDGEFUSION DATA EXPORTER")
+    print(f"  Target: {args.what} | Format: {args.format}")
+    print(f"{'━'*55}\n")
+
+    written = run_export(args.what, args.format, args.since)
+
+    print(f"\n{'━'*55}")
+    print(f"  ✅ {len(written)} file(s) exported to outputs/exports/")
+    print(f"{'━'*55}\n")
 
 
 if __name__ == "__main__":
-    export_dashboard_data()
+    main()

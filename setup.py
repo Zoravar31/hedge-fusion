@@ -139,7 +139,7 @@ def run_self_test():
         os.environ.setdefault("OPENAI_API_KEY", "sk-test")
         os.environ.setdefault("KITE_PAPER_TRADE", "true")
 
-        from agents.prompts import FUNDAMENTALS_PROMPT, PORTFOLIO_MANAGER_PROMPT
+        from agents.prompts import FUNDAMENTALS_PROMPT
         from agents.runner  import parse_json_response
         from tools.india_data    import DATA_TOOL_MAP
         from tools.kite_execution import place_nse_order, _paper_mode

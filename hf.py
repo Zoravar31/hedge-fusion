@@ -22,6 +22,11 @@ Usage:
     python hf.py sector                   # sector rotation
     python hf.py earnings                 # earnings calendar
     python hf.py alerts --test            # test alert channels
+    python hf.py sizer --ticker RELIANCE --entry 1280 --stop 1220
+    python hf.py analytics                # XIRR/CAGR/Sharpe/Nifty benchmark
+    python hf.py feedback                 # agent confidence calibration
+    python hf.py memory --ticker RELIANCE # per-ticker agent memory
+    python hf.py export --what trades --format xlsx
     python hf.py scheduler                # start daily scheduler
     python hf.py config                   # show current config
     python hf.py status                   # system health check
@@ -67,11 +72,11 @@ MENU = """
   │  11. Test alerts                            │
   │  12. Start daily scheduler                  │
   │  13. Show config                            │
-  │  14. Position sizer                         │
-  │  15. Analytics (XIRR / Sharpe / Alpha)      │
-  │  16. Feedback engine (signal accuracy)      │
-  │  17. Agent memory report                    │
-  │  18. Export dashboard data                  │
+  │  14. Position size calculator               │
+  │  15. Analytics (XIRR/CAGR/Sharpe)           │
+  │  16. Feedback engine (agent calibration)    │
+  │  17. Agent memory viewer                    │
+  │  18. Export data (CSV/Excel/JSON)           │
   │  0.  Exit                                   │
   └─────────────────────────────────────────────┘
 """
@@ -189,8 +194,17 @@ def cmd_journal(args):
 
 
 def cmd_backtest(args):
-    from backtester import run_backtest
-    run_backtest()
+    from backtester import run_backtest, run_walkforward_backtest
+    if getattr(args, "walkforward", False):
+        run_walkforward_backtest(
+            train_start=getattr(args, "train_start", "2022-01-01"),
+            train_end=getattr(args, "train_end",   "2023-12-31"),
+            test_start=getattr(args, "test_start",  "2024-01-01"),
+            test_end=getattr(args, "test_end",    "2025-12-31"),
+            stop_loss_pct=getattr(args, "sl", 5.0),
+        )
+    else:
+        run_backtest()
 
 
 def cmd_risk(args):
@@ -223,73 +237,71 @@ def cmd_earnings(args):
 
 def cmd_fii(args):
     from fii_dii_dashboard import run_fii_dii_dashboard
-    tickers = [t.strip() for t in args.tickers.split(",")] if getattr(args,"tickers",None) else None
-    stock   = getattr(args, "stock", None)
-    if stock:
-        from tools.fii_dii import analyse_stock_fii_dii
-        import json
-        print(json.dumps(analyse_stock_fii_dii(stock.upper()), indent=2, default=str))
+    import json
+    from tools.fii_dii import get_fii_dii_summary, get_bulk_deals
+
+    if getattr(args, "flows", False):
+        s = json.loads(get_fii_dii_summary())
+        print(json.dumps(s, indent=2, default=str))
+    elif getattr(args, "bulk", False):
+        b = json.loads(get_bulk_deals())
+        print(json.dumps(b, indent=2, default=str))
+    elif getattr(args, "stock", None):
+        from fii_dii_dashboard import analyse_stock_fii_dii
+        print(json.dumps(analyse_stock_fii_dii(args.stock.upper()), indent=2, default=str))
     else:
-        run_fii_dii_dashboard(stock_tickers=tickers, use_ai=not getattr(args,"no_ai",False))
-
-
-def cmd_sizer(args):
-    from position_sizer import interactive_calculator, calculate_position
-    if getattr(args, 'entry', None) and getattr(args, 'stop', None):
-        from config import PORTFOLIO_SIZE_INR
-        import json
-        result = calculate_position(
-            portfolio_inr=PORTFOLIO_SIZE_INR,
-            entry_price=args.entry,
-            stop_loss=args.stop,
-            target_price=getattr(args, 'target', 0) or 0,
-            risk_pct=getattr(args, 'risk', 2.0) or 2.0,
-        )
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        interactive_calculator()
-
-
-def cmd_analytics(args):
-    from analytics import compute_portfolio_analytics, print_analytics_report, save_analytics
-    from config import HOLDINGS
-    print("\nRunning portfolio analytics (fetching 1Y data)...")
-    r = compute_portfolio_analytics(HOLDINGS)
-    print_analytics_report(r)
-    if getattr(args, 'save', False):
-        save_analytics(r)
-
-
-def cmd_feedback(args):
-    from feedback_engine import run_feedback_engine, print_accuracy_report, compute_accuracy, load_outcomes
-    if getattr(args, 'report', False):
-        from feedback_engine import load_outcomes, compute_accuracy
-        acc = compute_accuracy(load_outcomes())
-        print_accuracy_report(acc)
-    else:
-        acc = run_feedback_engine(ticker=getattr(args, 'ticker', None))
-        print_accuracy_report(acc)
-
-
-def cmd_memory(args):
-    from agent_memory import print_memory_report, get_memory_context
-    ticker = getattr(args, 'ticker', None)
-    if ticker:
-        ctx = get_memory_context(ticker.upper())
-        print(f"\nMemory context for {ticker.upper()}:\n")
-        print(ctx)
-    else:
-        print_memory_report()
-
-
-def cmd_export(args):
-    from data_exporter import export_dashboard_data
-    export_dashboard_data(silent=False)
+        tickers = [t.strip() for t in args.tickers.split(",")] if getattr(args, "tickers", None) else None
+        run_fii_dii_dashboard(stock_tickers=tickers, use_ai=not getattr(args, "no_ai", False))
 
 
 def cmd_alerts(args):
     from alert_system import send_test_alert
     send_test_alert()
+
+
+def cmd_sizer(args):
+    from position_sizer import calculate_position_size, print_result
+    method = "kelly" if getattr(args, "kelly", False) else "atr" if getattr(args, "atr", False) else "fixed"
+    result = calculate_position_size(
+        ticker=args.ticker,
+        entry_price=args.entry,
+        stop_loss_price=getattr(args, "stop", None),
+        risk_pct=getattr(args, "risk", 1.0),
+        method=method,
+    )
+    print_result(result)
+
+
+def cmd_analytics(args):
+    from analytics import run_analytics
+    run_analytics(since_days=getattr(args, "since", 365))
+
+
+def cmd_feedback(args):
+    from feedback_engine import run_feedback_engine
+    run_feedback_engine(
+        since_days=getattr(args, "since", 365),
+        forward_days=getattr(args, "forward", 30),
+    )
+
+
+def cmd_memory(args):
+    from agent_memory import _print_history, _print_stats, clear_memory
+    if getattr(args, "clear", False):
+        clear_memory(getattr(args, "ticker", None))
+    elif getattr(args, "ticker", None):
+        _print_history(args.ticker)
+    else:
+        _print_stats()
+
+
+def cmd_export(args):
+    from data_exporter import run_export
+    run_export(
+        what=getattr(args, "what", "all"),
+        fmt=getattr(args, "format", "csv"),
+        since_days=getattr(args, "since", 365),
+    )
 
 
 def cmd_scheduler(args):
@@ -325,7 +337,7 @@ def interactive():
 
     while True:
         print(MENU)
-        choice = input("  Enter choice (0-12): ").strip()
+        choice = input("  Enter choice (0-18): ").strip()
 
         if choice == "0":
             print("\n  Goodbye.\n")
@@ -360,8 +372,13 @@ def interactive():
             run_journal()
 
         elif choice == "6":
-            from backtester import run_backtest
-            run_backtest()
+            mode = input("  (1) Standard backtest  (2) Walk-forward [train/test split]: ").strip()
+            if mode == "2":
+                from backtester import run_walkforward_backtest
+                run_walkforward_backtest()
+            else:
+                from backtester import run_backtest
+                run_backtest()
 
         elif choice == "7":
             from risk_dashboard import run_risk_dashboard
@@ -394,28 +411,31 @@ def interactive():
             cmd_config(FakeArgs())
 
         elif choice == "14":
-            from position_sizer import interactive_calculator
-            interactive_calculator()
+            ticker = input("  Ticker: ").strip().upper()
+            entry  = float(input("  Entry price ₹: ").strip())
+            stop_s = input("  Stop loss ₹ (blank = auto): ").strip()
+            stop   = float(stop_s) if stop_s else None
+            from position_sizer import calculate_position_size, print_result
+            print_result(calculate_position_size(ticker, entry, stop))
 
         elif choice == "15":
-            from analytics import compute_portfolio_analytics, print_analytics_report
-            from config import HOLDINGS
-            print("  Running analytics (takes ~30 sec)...")
-            r = compute_portfolio_analytics(HOLDINGS)
-            print_analytics_report(r)
+            from analytics import run_analytics
+            run_analytics()
 
         elif choice == "16":
-            from feedback_engine import run_feedback_engine, print_accuracy_report
-            acc = run_feedback_engine()
-            print_accuracy_report(acc)
+            from feedback_engine import run_feedback_engine
+            run_feedback_engine()
 
         elif choice == "17":
-            from agent_memory import print_memory_report
-            print_memory_report()
+            ticker = input("  Ticker (blank = system stats): ").strip().upper()
+            from agent_memory import _print_history, _print_stats
+            _print_history(ticker) if ticker else _print_stats()
 
         elif choice == "18":
-            from data_exporter import export_dashboard_data
-            export_dashboard_data()
+            what = input("  Export what? (trades/journal/holdings/watchlist/portfolio/memory/all) [all]: ").strip() or "all"
+            fmt  = input("  Format? (csv/xlsx/json) [csv]: ").strip() or "csv"
+            from data_exporter import run_export
+            run_export(what, fmt)
 
         else:
             print("  Invalid choice. Please enter 0-18.")
@@ -460,7 +480,14 @@ def main():
     p_jn.add_argument("--since", type=int, default=90)
 
     # others
-    sub.add_parser("backtest", help="Backtest signals")
+    p_bt = sub.add_parser("backtest", help="Backtest signals")
+    p_bt.add_argument("--walkforward", action="store_true",
+                      help="Run walk-forward backtest (train/test split)")
+    p_bt.add_argument("--train-start", default="2022-01-01", dest="train_start")
+    p_bt.add_argument("--train-end",   default="2023-12-31", dest="train_end")
+    p_bt.add_argument("--test-start",  default="2024-01-01", dest="test_start")
+    p_bt.add_argument("--test-end",    default="2025-12-31", dest="test_end")
+    p_bt.add_argument("--sl",          default=5.0, type=float, help="Stop-loss %%")
     sub.add_parser("risk",     help="Risk dashboard")
 
     p_sec = sub.add_parser("sector", help="Sector rotation")
@@ -475,24 +502,35 @@ def main():
     p_fii = sub.add_parser("fii", help="FII/DII intelligence dashboard")
     p_fii.add_argument("--stock",   help="Deep-dive one stock e.g. HDFCBANK")
     p_fii.add_argument("--tickers", help="Comma-separated tickers")
+    p_fii.add_argument("--flows",   action="store_true", help="Market-level FII/DII flows only")
+    p_fii.add_argument("--bulk",    action="store_true", help="Bulk/block deals only")
     p_fii.add_argument("--no-ai",   action="store_true")
 
     p_sz = sub.add_parser("sizer", help="Position size calculator")
-    p_sz.add_argument("--entry",  type=float, help="Entry price")
-    p_sz.add_argument("--stop",   type=float, help="Stop loss price")
-    p_sz.add_argument("--target", type=float, help="Target price")
-    p_sz.add_argument("--risk",   type=float, default=2.0, help="Risk pct")
-    p_an = sub.add_parser("analytics", help="XIRR, CAGR, Sharpe, benchmark vs Nifty")
-    p_an.add_argument("--save", action="store_true", help="Save to data/analytics.json")
+    p_sz.add_argument("--ticker", required=True, help="NSE ticker e.g. RELIANCE")
+    p_sz.add_argument("--entry",  required=True, type=float, help="Entry price ₹")
+    p_sz.add_argument("--stop",   type=float, help="Stop loss price ₹")
+    p_sz.add_argument("--risk",   type=float, default=1.0, help="Risk %% of portfolio")
+    p_sz.add_argument("--kelly",  action="store_true", help="Use half-Kelly sizing")
+    p_sz.add_argument("--atr",    action="store_true", help="Use ATR-based stop")
 
-    p_fb = sub.add_parser("feedback",  help="Evaluate signal accuracy + feedback loop")
-    p_fb.add_argument("--ticker", help="Evaluate one ticker")
-    p_fb.add_argument("--report", action="store_true", help="Show report only")
+    p_an = sub.add_parser("analytics", help="XIRR / CAGR / Sharpe / Nifty benchmark")
+    p_an.add_argument("--since", type=int, default=365, help="Days of history")
 
-    p_mem = sub.add_parser("memory",    help="Show agent memory per ticker")
+    p_fb = sub.add_parser("feedback", help="Agent calibration & veto effectiveness")
+    p_fb.add_argument("--since",   type=int, default=365, help="Days of pipeline history")
+    p_fb.add_argument("--forward", type=int, default=30,  help="Forward days to evaluate outcome")
+
+    p_mem = sub.add_parser("memory", help="Per-ticker agent memory")
     p_mem.add_argument("--ticker", help="Show memory for one ticker")
+    p_mem.add_argument("--clear",  action="store_true", help="Clear memory (ticker or all)")
 
-    sub.add_parser("export",     help="Export dashboard data to data/dashboard_data.json")
+    p_exp = sub.add_parser("export", help="Export data to CSV/Excel/JSON")
+    p_exp.add_argument("--what",   default="all",
+                       choices=["trades", "journal", "holdings", "watchlist", "portfolio", "memory", "all"])
+    p_exp.add_argument("--format", default="csv", choices=["csv", "xlsx", "json"])
+    p_exp.add_argument("--since",  type=int, default=365)
+
     sub.add_parser("alerts",    help="Test alert channels")
     sub.add_parser("scheduler", help="Start daily scheduler")
     sub.add_parser("config",    help="Show configuration")
